@@ -1,0 +1,7 @@
+{
+  "projects": {
+    "default": "todo-taskmanager-25ab4",
+    "dev": "todo-taskmanager-25ab4",
+    "prod": "todo-taskmanager-25ab4"
+  }
+}

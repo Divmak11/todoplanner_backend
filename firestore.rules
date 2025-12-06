@@ -1,0 +1,188 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // ============================================
+    // HELPER FUNCTIONS
+    // ============================================
+    
+    // Check if user is authenticated
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    // Get user document
+    function getUserData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+    
+    // Check if user is Super Admin
+    function isSuperAdmin() {
+      return isAuthenticated() && getUserData().role == 'super_admin';
+    }
+    
+    // Check if user is Team Admin
+    function isTeamAdmin() {
+      return isAuthenticated() && getUserData().role == 'team_admin';
+    }
+    
+    // Check if user is approved (active status)
+    function isApproved() {
+      return isAuthenticated() && getUserData().status == 'active';
+    }
+    
+    // Check if user is admin (Super Admin or Team Admin)
+    function isAdmin() {
+      return isSuperAdmin() || isTeamAdmin();
+    }
+    
+    // ============================================
+    // USERS COLLECTION
+    // ============================================
+    match /users/{userId} {
+      // Anyone authenticated can read user profiles
+      allow read: if isAuthenticated();
+      
+      // Users can create their own profile (handled by auth trigger)
+      allow create: if isAuthenticated() && request.auth.uid == userId;
+      
+      // Users can update their own profile (limited fields)
+      // Super Admin can update any user
+      allow update: if isAuthenticated() && (
+        request.auth.uid == userId || 
+        isSuperAdmin()
+      );
+      
+      // Only Super Admin can delete users
+      allow delete: if isSuperAdmin();
+    }
+    
+    // ============================================
+    // TEAMS COLLECTION
+    // ============================================
+    match /teams/{teamId} {
+      // Approved users can read teams
+      allow read: if isApproved();
+      
+      // Only Super Admin can create teams
+      allow create: if isSuperAdmin();
+      
+      // Super Admin or Team Admin of this team can update
+      allow update: if isApproved() && (
+        isSuperAdmin() || 
+        resource.data.adminId == request.auth.uid
+      );
+      
+      // Only Super Admin can delete teams
+      allow delete: if isSuperAdmin();
+    }
+    
+    // ============================================
+    // TASKS COLLECTION
+    // ============================================
+    match /tasks/{taskId} {
+      // Approved users can read tasks
+      // (Frontend filters by assignedTo or createdBy)
+      allow read: if isApproved();
+      
+      // Approved users can create tasks
+      allow create: if isApproved();
+      
+      // Task can be updated by:
+      // - Assignee (for status changes, completion)
+      // - Creator (for editing task details)
+      // - Super Admin (for any changes)
+      allow update: if isApproved() && (
+        resource.data.assignedTo == request.auth.uid ||
+        resource.data.createdBy == request.auth.uid ||
+        isSuperAdmin()
+      );
+      
+      // Only Super Admin can delete tasks
+      allow delete: if isSuperAdmin();
+    }
+    
+    // ============================================
+    // REMARKS COLLECTION
+    // ============================================
+    match /remarks/{remarkId} {
+      // Approved users can read remarks
+      allow read: if isApproved();
+      
+      // Approved users can create remarks
+      allow create: if isApproved();
+      
+      // Only the author can update/delete their remark
+      allow update, delete: if isAuthenticated() && 
+        resource.data.userId == request.auth.uid;
+    }
+    
+    // ============================================
+    // APPROVAL REQUESTS COLLECTION
+    // ============================================
+    match /approvalRequests/{requestId} {
+      // Approved users and Super Admin can read
+      allow read: if isAuthenticated() && (
+        isApproved() || 
+        isSuperAdmin() ||
+        resource.data.requesterId == request.auth.uid
+      );
+      
+      // Approved users can create requests
+      allow create: if isAuthenticated();
+      
+      // Super Admin or task creator can update (approve/reject)
+      allow update: if isApproved() && (
+        isSuperAdmin() ||
+        // For reschedule requests, task creator can approve
+        resource.data.type == 'reschedule'
+      );
+      
+      // Only Super Admin can delete
+      allow delete: if isSuperAdmin();
+    }
+    
+    // ============================================
+    // RESCHEDULE LOG COLLECTION
+    // ============================================
+    match /rescheduleLog/{logId} {
+      // Only admins can read reschedule logs
+      allow read: if isAdmin();
+      
+      // Only Cloud Functions can write (no direct client writes)
+      allow write: if false;
+    }
+    
+    // ============================================
+    // NOTIFICATIONS COLLECTION
+    // ============================================
+    match /notifications/{notificationId} {
+      // Users can only read their own notifications
+      allow read: if isAuthenticated() && 
+        resource.data.userId == request.auth.uid;
+      
+      // Users can update their own notifications (mark as read)
+      allow update: if isAuthenticated() && 
+        resource.data.userId == request.auth.uid;
+      
+      // Users can delete their own notifications
+      allow delete: if isAuthenticated() && 
+        resource.data.userId == request.auth.uid;
+      
+      // Only Cloud Functions can create notifications
+      allow create: if false;
+    }
+    
+    // ============================================
+    // INVITES COLLECTION
+    // ============================================
+    match /invites/{inviteId} {
+      // Super Admin can read all invites
+      allow read: if isSuperAdmin();
+      
+      // All invite operations are handled by Cloud Functions
+      // No direct client writes allowed
+      allow create, update, delete: if false;
+    }
+  }
+}

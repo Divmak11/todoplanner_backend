@@ -1,0 +1,204 @@
+import * as functions from 'firebase-functions';
+import { admin, db } from '../config/firebase-admin';
+import { Collections, TaskStatus, NotificationType } from '../config/constants';
+import {
+  sendNotification,
+  notifySuperAdmins,
+  createNotificationData,
+} from '../services/notificationService';
+
+/**
+ * Scheduled function: Check for upcoming deadlines and send reminders
+ * Runs every hour
+ */
+export const checkDeadlines = functions.region('asia-south1').pubsub
+  .schedule('every 1 hours')
+  .onRun(async () => {
+    const now = admin.firestore.Timestamp.now();
+    const nowMs = now.toMillis();
+
+    // Define time window for 24-hour reminder
+    const oneDayMs = 24 * 60 * 60 * 1000;
+    const oneHourMs = 60 * 60 * 1000; // Used for time window calculation
+
+    // Get all ongoing tasks
+    const ongoingTasks = await db.collection(Collections.TASKS)
+      .where('status', '==', TaskStatus.ONGOING)
+      .get();
+
+    // Process tasks in parallel batches for better performance
+    const reminderPromises: Promise<void>[] = [];
+
+    for (const doc of ongoingTasks.docs) {
+      const task = doc.data();
+      const taskId = doc.id;
+      const deadlineMs = task.deadline?.toMillis();
+
+      if (!deadlineMs) continue;
+
+      const timeUntilDeadline = deadlineMs - nowMs;
+
+      // 24-hour reminder only (between 23-24 hours before deadline)
+      if (timeUntilDeadline > oneDayMs - oneHourMs && timeUntilDeadline <= oneDayMs) {
+        reminderPromises.push(sendDeadlineReminder(taskId, task));
+      }
+    }
+
+    // Execute all reminders in parallel
+    await Promise.all(reminderPromises);
+
+    console.log(`Deadline check completed. Processed ${ongoingTasks.size} tasks.`);
+  });
+
+/**
+ * Helper: Send 24-hour deadline reminder to assignee and creator
+ */
+async function sendDeadlineReminder(
+  taskId: string,
+  task: admin.firestore.DocumentData
+): Promise<void> {
+  // Notify assignee
+  await sendNotification(
+    task.assignedTo,
+    '⏰ Due Tomorrow',
+    `"${task.title}"`,
+    createNotificationData(NotificationType.TASK_OVERDUE, { taskId })
+  );
+
+  // Notify creator (if different from assignee)
+  if (task.createdBy !== task.assignedTo) {
+    await sendNotification(
+      task.createdBy,
+      '⏰ Due Tomorrow',
+      `"${task.title}" assigned to team member`,
+      createNotificationData(NotificationType.TASK_OVERDUE, { taskId })
+    );
+  }
+}
+
+/**
+ * Scheduled function: Check for overdue tasks
+ * Runs daily at 9 AM
+ */
+export const checkOverdueTasks = functions.region('asia-south1').pubsub
+  .schedule('0 9 * * *')
+  .timeZone('Asia/Kolkata')
+  .onRun(async () => {
+    const now = admin.firestore.Timestamp.now();
+
+    // Get all overdue ongoing tasks
+    const overdueTasks = await db.collection(Collections.TASKS)
+      .where('status', '==', TaskStatus.ONGOING)
+      .where('deadline', '<', now)
+      .get();
+
+    if (overdueTasks.empty) {
+      console.log('No overdue tasks found.');
+      return;
+    }
+
+    // Group tasks by assignee, creator, and team admin for summary notifications
+    const tasksByAssignee: Map<string, string[]> = new Map();
+    const tasksByCreator: Map<string, string[]> = new Map();
+    const tasksByTeamAdmin: Map<string, string[]> = new Map();
+    const allOverdueTasks: string[] = [];
+
+    // Get all teams for team admin lookup
+    const teamsSnapshot = await db.collection(Collections.TEAMS).get();
+    const teamAdminByMember: Map<string, string> = new Map();
+    teamsSnapshot.docs.forEach((doc: admin.firestore.QueryDocumentSnapshot) => {
+      const team = doc.data();
+      const adminId = team.adminId;
+      const memberIds: string[] = team.memberIds || [];
+      if (adminId) {
+        memberIds.forEach((memberId: string) => {
+          if (memberId !== adminId) {
+            teamAdminByMember.set(memberId, adminId);
+          }
+        });
+      }
+    });
+
+    for (const doc of overdueTasks.docs) {
+      const task = doc.data();
+
+      // Group by assignee
+      const assigneeTasks = tasksByAssignee.get(task.assignedTo) || [];
+      assigneeTasks.push(task.title);
+      tasksByAssignee.set(task.assignedTo, assigneeTasks);
+
+      // Group by creator
+      if (task.createdBy !== task.assignedTo) {
+        const creatorTasks = tasksByCreator.get(task.createdBy) || [];
+        creatorTasks.push(task.title);
+        tasksByCreator.set(task.createdBy, creatorTasks);
+      }
+
+      // Group by team admin (if assignee is a team member)
+      const teamAdminId = teamAdminByMember.get(task.assignedTo);
+      if (teamAdminId && teamAdminId !== task.createdBy && teamAdminId !== task.assignedTo) {
+        const adminTasks = tasksByTeamAdmin.get(teamAdminId) || [];
+        adminTasks.push(task.title);
+        tasksByTeamAdmin.set(teamAdminId, adminTasks);
+      }
+
+      allOverdueTasks.push(task.title);
+    }
+
+    // Send notifications to assignees
+    for (const [assigneeId, tasks] of tasksByAssignee) {
+      const count = tasks.length;
+      await sendNotification(
+        assigneeId,
+        `🔴 ${count} Overdue`,
+        count === 1 ? `"${tasks[0]}"` : `${count} tasks need attention`,
+        createNotificationData(NotificationType.TASK_OVERDUE)
+      );
+    }
+
+    // Send notifications to creators
+    for (const [creatorId, tasks] of tasksByCreator) {
+      const count = tasks.length;
+      await sendNotification(
+        creatorId,
+        `📊 Tasks Overdue`,
+        count === 1 ? `"${tasks[0]}"` : `${count} assigned tasks past deadline`,
+        createNotificationData(NotificationType.TASK_OVERDUE)
+      );
+    }
+
+    // Send notifications to team admins
+    for (const [adminId, tasks] of tasksByTeamAdmin) {
+      const count = tasks.length;
+      await sendNotification(
+        adminId,
+        `👥 Team Tasks Overdue`,
+        count === 1 ? `"${tasks[0]}"` : `${count} team member tasks past deadline`,
+        createNotificationData(NotificationType.TASK_OVERDUE)
+      );
+    }
+
+    // Notify Super Admins with summary
+    if (allOverdueTasks.length > 0) {
+      await notifySuperAdmins(
+        '📊 Daily Report',
+        `${allOverdueTasks.length} overdue task${allOverdueTasks.length > 1 ? 's' : ''} across team`,
+        createNotificationData(NotificationType.TASK_OVERDUE)
+      );
+    }
+
+    console.log(`Overdue check completed. Found ${overdueTasks.size} overdue tasks.`);
+  });
+
+/**
+ * Scheduled function: Update user last active timestamp
+ * Runs daily to clean up inactive users tracking
+ */
+export const cleanupInactiveTracking = functions.region('asia-south1').pubsub
+  .schedule('0 0 * * *')
+  .timeZone('Asia/Kolkata')
+  .onRun(async () => {
+    // This is a placeholder for any cleanup tasks
+    // Could be used to archive old data, clean up orphaned records, etc.
+    console.log('Daily cleanup completed.');
+  });
