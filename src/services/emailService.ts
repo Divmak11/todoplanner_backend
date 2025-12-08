@@ -59,6 +59,11 @@ export async function sendInviteEmail(
     const sgMail = await import('@sendgrid/mail');
     sgMail.default.setApiKey(config.apiKey);
 
+    // Validate from email format
+    if (!config.fromEmail || !config.fromEmail.includes('@')) {
+      throw new Error(`Invalid from email: ${config.fromEmail}`);
+    }
+
     // Play Store link placeholder - replace with actual link
     const playStoreLink = 'https://play.google.com/store/apps/details?id=com.yourapp.todo';
     const teamMessage = teamName
@@ -148,11 +153,24 @@ If you didn't expect this invitation, you can safely ignore this email.
     };
 
     await sgMail.default.send(msg);
-    console.log(`Invite email sent to ${toEmail}`);
+    console.log(`✅ Invite email sent successfully to ${toEmail}`);
     return true;
-  } catch (error) {
-    console.error('Failed to send invite email:', error);
-    return false;
+  } catch (error: any) {
+    // Log detailed error for debugging
+    console.error('❌ SendGrid email error:', {
+      to: toEmail,
+      from: config.fromEmail,
+      error: error.message,
+      response: error.response?.body,
+    });
+
+    // Throw detailed error instead of returning false
+    throw new Error(
+      `SendGrid email failed: ${error.message}${error.response?.body?.errors
+        ? ` - ${JSON.stringify(error.response.body.errors)}`
+        : ''
+      }`
+    );
   }
 }
 

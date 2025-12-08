@@ -3,7 +3,7 @@ import * as crypto from 'crypto';
 import { admin, db } from '../config/firebase-admin';
 import { Collections, InviteStatus, NotificationType } from '../config/constants';
 import { validateSuperAdminAsync, validateRequiredString } from '../utils/validators';
-import { sendInviteEmail, sendInviteAcceptedEmail, isEmailConfigured } from '../services/emailService';
+import { sendInviteEmail, sendInviteAcceptedEmail } from '../services/emailService';
 import { sendNotification, createNotificationData } from '../services/notificationService';
 import { SendInviteInput, ResendInviteInput, CancelInviteInput } from '../types';
 
@@ -101,20 +101,23 @@ export const sendInvite = functions.region('asia-south1').https.onCall(
     });
 
     // Send invite email
-    const emailSent = await sendInviteEmail(email, inviterName, token, teamName);
-
-    if (!emailSent && isEmailConfigured()) {
-      // Delete the invite if email failed to send (only if email was supposed to be sent)
+    try {
+      await sendInviteEmail(email, inviterName, token, teamName);
+      console.log(`✅ Invite sent successfully to ${email}`);
+    } catch (emailError: any) {
+      // If email sending fails, delete the invite and throw error
       await inviteRef.delete();
-      throw new functions.https.HttpsError('internal', 'Failed to send invite email');
+      console.error(`❌ Failed to send invite to ${email}:`, emailError.message);
+      throw new functions.https.HttpsError(
+        'internal',
+        `Failed to send invite email: ${emailError.message}`
+      );
     }
 
     return {
       success: true,
       inviteId: inviteRef.id,
-      message: isEmailConfigured() ?
-        'Invite sent successfully' :
-        'Invite created (email not configured - user can sign up normally)',
+      message: 'Invite sent successfully',
     };
   }
 );

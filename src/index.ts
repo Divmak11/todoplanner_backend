@@ -106,3 +106,8 @@ export {
   checkOverdueTasks,
   cleanupInactiveTracking,
 } from './triggers/scheduledFunctions';
+
+// ============================================
+// REPORT EXPORT FUNCTIONS
+// ============================================
+export { exportReport } from './controllers/reportController';
