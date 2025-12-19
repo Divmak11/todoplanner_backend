@@ -1,4 +1,4 @@
-import * as functions from 'firebase-functions';
+import { onCall, HttpsError, CallableRequest } from 'firebase-functions/v2/https';
 import { admin, db } from '../config/firebase-admin';
 import { Collections, NotificationType } from '../config/constants';
 import {
@@ -11,19 +11,26 @@ import {
 } from '../services/notificationService';
 import { AddRemarkInput } from '../types';
 
+// 2nd Gen configuration for callable functions
+const callableConfig = { region: 'asia-south1', concurrency: 80 };
+
 /**
  * Add a remark to a task
  * Only assignee, creator, or admin can add remarks
  */
-export const addRemark = functions.region('asia-south1').https.onCall(
-  async (data: AddRemarkInput, context: functions.https.CallableContext) => {
+export const addRemark = onCall(
+  callableConfig,
+  async (request: CallableRequest<AddRemarkInput>) => {
+    const data = request.data;
+    const context = { auth: request.auth };
+
     const callerId = validateAuthenticated(context);
     const taskId = validateRequiredString(data.taskId, 'taskId');
     const message = validateRequiredString(data.message, 'message');
 
     // Validate message length
     if (message.length > 500) {
-      throw new functions.https.HttpsError(
+      throw new HttpsError(
         'invalid-argument',
         'Remark message cannot exceed 500 characters'
       );
@@ -32,7 +39,7 @@ export const addRemark = functions.region('asia-south1').https.onCall(
     // Get task to verify permissions
     const taskDoc = await db.collection(Collections.TASKS).doc(taskId).get();
     if (!taskDoc.exists) {
-      throw new functions.https.HttpsError('not-found', 'Task not found');
+      throw new HttpsError('not-found', 'Task not found');
     }
 
     const task = taskDoc.data()!;
@@ -40,13 +47,13 @@ export const addRemark = functions.region('asia-south1').https.onCall(
     // Get caller's data from Firestore
     const callerDoc = await db.collection(Collections.USERS).doc(callerId).get();
     if (!callerDoc.exists) {
-      throw new functions.https.HttpsError('not-found', 'User not found');
+      throw new HttpsError('not-found', 'User not found');
     }
     const callerData = callerDoc.data()!;
 
     // Check if user is approved (active status)
     if (callerData.status !== 'active') {
-      throw new functions.https.HttpsError(
+      throw new HttpsError(
         'permission-denied',
         'User is not approved'
       );

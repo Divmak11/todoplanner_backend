@@ -1,11 +1,14 @@
-import * as functions from 'firebase-functions';
+import { onCall, HttpsError, CallableRequest } from 'firebase-functions/v2/https';
 import * as crypto from 'crypto';
 import { admin, db } from '../config/firebase-admin';
 import { Collections, InviteStatus, NotificationType } from '../config/constants';
-import { validateSuperAdminAsync, validateRequiredString } from '../utils/validators';
+import { validateSuperAdminAsync, validateRequiredString, validateAuthenticated } from '../utils/validators';
 import { sendInviteEmail, sendInviteAcceptedEmail } from '../services/emailService';
 import { sendNotification, createNotificationData } from '../services/notificationService';
 import { SendInviteInput, ResendInviteInput, CancelInviteInput } from '../types';
+
+// 2nd Gen configuration for callable functions
+const callableConfig = { region: 'asia-south1', concurrency: 80 };
 
 // Invite validity period: 7 days
 const INVITE_VALIDITY_DAYS = 7;
@@ -32,8 +35,12 @@ function getExpirationTimestamp(): admin.firestore.Timestamp {
  * Send an invite to a new user
  * Only Super Admin or Team Admin can send invites
  */
-export const sendInvite = functions.region('asia-south1').https.onCall(
-  async (data: SendInviteInput, context: functions.https.CallableContext) => {
+export const sendInvite = onCall(
+  callableConfig,
+  async (request: CallableRequest<SendInviteInput>) => {
+    const data = request.data;
+    const context = { auth: request.auth };
+
     // Validate caller is super admin
     const inviterId = await validateSuperAdminAsync(context);
     const email = validateRequiredString(data.email, 'email').toLowerCase().trim();
@@ -42,7 +49,7 @@ export const sendInvite = functions.region('asia-south1').https.onCall(
     // Validate email format
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
     if (!emailRegex.test(email)) {
-      throw new functions.https.HttpsError('invalid-argument', 'Invalid email format');
+      throw new HttpsError('invalid-argument', 'Invalid email format');
     }
 
     // Check if user already exists with this email
@@ -52,7 +59,7 @@ export const sendInvite = functions.region('asia-south1').https.onCall(
       .get();
 
     if (!existingUsers.empty) {
-      throw new functions.https.HttpsError(
+      throw new HttpsError(
         'already-exists',
         'A user with this email already exists'
       );
@@ -66,7 +73,7 @@ export const sendInvite = functions.region('asia-south1').https.onCall(
       .get();
 
     if (!existingInvites.empty) {
-      throw new functions.https.HttpsError(
+      throw new HttpsError(
         'already-exists',
         'An invite has already been sent to this email'
       );
@@ -77,7 +84,7 @@ export const sendInvite = functions.region('asia-south1').https.onCall(
     if (teamId) {
       const teamDoc = await db.collection(Collections.TEAMS).doc(teamId).get();
       if (!teamDoc.exists) {
-        throw new functions.https.HttpsError('not-found', 'Team not found');
+        throw new HttpsError('not-found', 'Team not found');
       }
       teamName = teamDoc.data()!.name;
     }
@@ -108,7 +115,7 @@ export const sendInvite = functions.region('asia-south1').https.onCall(
       // If email sending fails, delete the invite and throw error
       await inviteRef.delete();
       console.error(`❌ Failed to send invite to ${email}:`, emailError.message);
-      throw new functions.https.HttpsError(
+      throw new HttpsError(
         'internal',
         `Failed to send invite email: ${emailError.message}`
       );
@@ -126,21 +133,25 @@ export const sendInvite = functions.region('asia-south1').https.onCall(
  * Resend an invite email
  * Only Super Admin can resend invites
  */
-export const resendInvite = functions.region('asia-south1').https.onCall(
-  async (data: ResendInviteInput, context: functions.https.CallableContext) => {
+export const resendInvite = onCall(
+  callableConfig,
+  async (request: CallableRequest<ResendInviteInput>) => {
+    const data = request.data;
+    const context = { auth: request.auth };
+
     const inviterId = await validateSuperAdminAsync(context);
     const inviteId = validateRequiredString(data.inviteId, 'inviteId');
 
     // Get invite
     const inviteDoc = await db.collection(Collections.INVITES).doc(inviteId).get();
     if (!inviteDoc.exists) {
-      throw new functions.https.HttpsError('not-found', 'Invite not found');
+      throw new HttpsError('not-found', 'Invite not found');
     }
 
     const invite = inviteDoc.data()!;
 
     if (invite.status !== InviteStatus.PENDING) {
-      throw new functions.https.HttpsError(
+      throw new HttpsError(
         'failed-precondition',
         `Cannot resend invite with status: ${invite.status}`
       );
@@ -182,20 +193,24 @@ export const resendInvite = functions.region('asia-south1').https.onCall(
  * Cancel a pending invite
  * Only Super Admin can cancel invites
  */
-export const cancelInvite = functions.region('asia-south1').https.onCall(
-  async (data: CancelInviteInput, context: functions.https.CallableContext) => {
+export const cancelInvite = onCall(
+  callableConfig,
+  async (request: CallableRequest<CancelInviteInput>) => {
+    const context = { auth: request.auth };
+    const data = request.data;
+
     await validateSuperAdminAsync(context);
     const inviteId = validateRequiredString(data.inviteId, 'inviteId');
 
     const inviteDoc = await db.collection(Collections.INVITES).doc(inviteId).get();
     if (!inviteDoc.exists) {
-      throw new functions.https.HttpsError('not-found', 'Invite not found');
+      throw new HttpsError('not-found', 'Invite not found');
     }
 
     const invite = inviteDoc.data()!;
 
     if (invite.status !== InviteStatus.PENDING) {
-      throw new functions.https.HttpsError(
+      throw new HttpsError(
         'failed-precondition',
         `Cannot cancel invite with status: ${invite.status}`
       );
@@ -214,8 +229,10 @@ export const cancelInvite = functions.region('asia-south1').https.onCall(
  * Validate an invite token (called when user opens invite link)
  * Public function - no auth required
  */
-export const validateInviteToken = functions.region('asia-south1').https.onCall(
-  async (data: { token: string }) => {
+export const validateInviteToken = onCall(
+  callableConfig,
+  async (request: CallableRequest<{ token: string }>) => {
+    const data = request.data;
     const token = validateRequiredString(data.token, 'token');
 
     const invites = await db.collection(Collections.INVITES)
@@ -225,7 +242,7 @@ export const validateInviteToken = functions.region('asia-south1').https.onCall(
       .get();
 
     if (invites.empty) {
-      throw new functions.https.HttpsError('not-found', 'Invalid or expired invite');
+      throw new HttpsError('not-found', 'Invalid or expired invite');
     }
 
     const invite = invites.docs[0].data();
@@ -235,7 +252,7 @@ export const validateInviteToken = functions.region('asia-south1').https.onCall(
     if (invite.expiresAt.toMillis() < now.toMillis()) {
       // Mark as expired
       await invites.docs[0].ref.update({ status: InviteStatus.EXPIRED });
-      throw new functions.https.HttpsError('deadline-exceeded', 'Invite has expired');
+      throw new HttpsError('deadline-exceeded', 'Invite has expired');
     }
 
     // Get team info if applicable
@@ -260,13 +277,13 @@ export const validateInviteToken = functions.region('asia-south1').https.onCall(
  * Accept an invite after user signs up
  * Called automatically when a user with an invite email signs up
  */
-export const acceptInvite = functions.region('asia-south1').https.onCall(
-  async (data: { token: string }, context: functions.https.CallableContext) => {
-    if (!context.auth) {
-      throw new functions.https.HttpsError('unauthenticated', 'Must be authenticated');
-    }
+export const acceptInvite = onCall(
+  callableConfig,
+  async (request: CallableRequest<{ token: string }>) => {
+    const data = request.data;
+    const context = { auth: request.auth };
 
-    const userId = context.auth.uid;
+    const userId = validateAuthenticated(context);
     const token = validateRequiredString(data.token, 'token');
 
     // Get invite by token
@@ -277,7 +294,7 @@ export const acceptInvite = functions.region('asia-south1').https.onCall(
       .get();
 
     if (invites.empty) {
-      throw new functions.https.HttpsError('not-found', 'Invalid or expired invite');
+      throw new HttpsError('not-found', 'Invalid or expired invite');
     }
 
     const inviteDoc = invites.docs[0];
@@ -286,12 +303,12 @@ export const acceptInvite = functions.region('asia-south1').https.onCall(
     // Verify email matches
     const userDoc = await db.collection(Collections.USERS).doc(userId).get();
     if (!userDoc.exists) {
-      throw new functions.https.HttpsError('not-found', 'User not found');
+      throw new HttpsError('not-found', 'User not found');
     }
 
     const user = userDoc.data()!;
     if (user.email.toLowerCase() !== invite.email.toLowerCase()) {
-      throw new functions.https.HttpsError(
+      throw new HttpsError(
         'permission-denied',
         'Email does not match invite'
       );
@@ -346,9 +363,14 @@ export const acceptInvite = functions.region('asia-south1').https.onCall(
 /**
  * Get all invites (for admin view)
  * Only Super Admin can view all invites
+ * Also auto-updates expired pending invites
  */
-export const getInvites = functions.region('asia-south1').https.onCall(
-  async (data: { status?: string }, context: functions.https.CallableContext) => {
+export const getInvites = onCall(
+  callableConfig,
+  async (request: CallableRequest<{ status?: string }>) => {
+    const data = request.data;
+    const context = { auth: request.auth };
+
     await validateSuperAdminAsync(context);
 
     let query: admin.firestore.Query = db.collection(Collections.INVITES)
@@ -360,15 +382,44 @@ export const getInvites = functions.region('asia-south1').https.onCall(
     }
 
     const invites = await query.get();
+    const now = admin.firestore.Timestamp.now();
+    const batch = db.batch();
+    let hasUpdates = false;
 
-    return {
-      invites: invites.docs.map((doc) => ({
+    // Auto-update expired pending invites
+    const processedInvites = invites.docs.map((doc) => {
+      const invite = doc.data();
+      let status = invite.status;
+
+      // Check if pending invite has expired
+      if (status === InviteStatus.PENDING && invite.expiresAt) {
+        const expiresAt = invite.expiresAt as admin.firestore.Timestamp;
+        if (expiresAt.toMillis() < now.toMillis()) {
+          // Mark as expired in batch
+          batch.update(doc.ref, {
+            status: InviteStatus.EXPIRED,
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+          status = InviteStatus.EXPIRED;
+          hasUpdates = true;
+        }
+      }
+
+      return {
         id: doc.id,
-        ...doc.data(),
-        createdAt: doc.data().createdAt?.toDate?.()?.toISOString(),
-        expiresAt: doc.data().expiresAt?.toDate?.()?.toISOString(),
-        acceptedAt: doc.data().acceptedAt?.toDate?.()?.toISOString(),
-      })),
-    };
+        ...invite,
+        status, // Use the potentially updated status
+        createdAt: invite.createdAt?.toDate?.()?.toISOString(),
+        expiresAt: invite.expiresAt?.toDate?.()?.toISOString(),
+        acceptedAt: invite.acceptedAt?.toDate?.()?.toISOString(),
+      };
+    });
+
+    // Commit batch updates if any invites were marked as expired
+    if (hasUpdates) {
+      await batch.commit();
+    }
+
+    return { invites: processedInvites };
   }
 );
