@@ -1,10 +1,11 @@
-import * as functions from 'firebase-functions';
+import { onCall, HttpsError, CallableRequest } from 'firebase-functions/v2/https';
 import { admin, db, auth } from '../config/firebase-admin';
 import { Collections, UserRole, UserStatus, TaskStatus, NotificationType } from '../config/constants';
 import {
   validateSuperAdminAsync,
   validateRequiredString,
   validateRole,
+  validateAuthenticated,
 } from '../utils/validators';
 import {
   sendNotification,
@@ -18,23 +19,30 @@ import {
   DeleteUserInput,
 } from '../types';
 
+// 2nd Gen configuration for callable functions
+const callableConfig = { region: 'asia-south1', concurrency: 80 };
+
 /**
  * Approve a pending user's access request
  * Only Super Admin can call this function
  */
-export const approveUserAccess = functions.region('asia-south1').https.onCall(
-  async (data: ApproveUserInput, context) => {
+export const approveUserAccess = onCall(
+  callableConfig,
+  async (request: CallableRequest<ApproveUserInput>) => {
+    const data = request.data;
+    const context = { auth: request.auth };
+
     const adminId = await validateSuperAdminAsync(context);
     const userId = validateRequiredString(data.userId, 'userId');
 
     const userDoc = await db.collection(Collections.USERS).doc(userId).get();
     if (!userDoc.exists) {
-      throw new functions.https.HttpsError('not-found', 'User not found');
+      throw new HttpsError('not-found', 'User not found');
     }
 
     const user = userDoc.data()!;
     if (user.status !== UserStatus.PENDING) {
-      throw new functions.https.HttpsError(
+      throw new HttpsError(
         'failed-precondition',
         'User is not in pending status'
       );
@@ -50,13 +58,15 @@ export const approveUserAccess = functions.region('asia-south1').https.onCall(
     // Set custom claims for the user
     await auth.setCustomUserClaims(userId, { role: user.role });
 
-    // Send notification to the approved user
-    await sendNotification(
+    // Fire-and-forget: Send notification in background (don't block the response)
+    sendNotification(
       userId,
       '✅ Welcome Aboard!',
       'Your account is now active',
       createNotificationData(NotificationType.APPROVAL_GRANTED, { userId })
-    );
+    ).catch((error) => {
+      console.error(`Failed to send approval notification to ${userId}:`, error);
+    });
 
     return { success: true, message: 'User approved successfully' };
   }
@@ -66,20 +76,24 @@ export const approveUserAccess = functions.region('asia-south1').https.onCall(
  * Reject a pending user's access request
  * Only Super Admin can call this function
  */
-export const rejectUserAccess = functions.region('asia-south1').https.onCall(
-  async (data: RejectUserInput, context) => {
+export const rejectUserAccess = onCall(
+  callableConfig,
+  async (request: CallableRequest<RejectUserInput>) => {
+    const data = request.data;
+    const context = { auth: request.auth };
+
     await validateSuperAdminAsync(context);
     const userId = validateRequiredString(data.userId, 'userId');
     const reason = data.reason;
 
     const userDoc = await db.collection(Collections.USERS).doc(userId).get();
     if (!userDoc.exists) {
-      throw new functions.https.HttpsError('not-found', 'User not found');
+      throw new HttpsError('not-found', 'User not found');
     }
 
     const user = userDoc.data()!;
     if (user.status !== UserStatus.PENDING) {
-      throw new functions.https.HttpsError(
+      throw new HttpsError(
         'failed-precondition',
         'User is not in pending status'
       );
@@ -113,15 +127,19 @@ export const rejectUserAccess = functions.region('asia-south1').https.onCall(
  * Update a user's role
  * Only Super Admin can call this function
  */
-export const updateUserRole = functions.region('asia-south1').https.onCall(
-  async (data: UpdateUserRoleInput, context) => {
+export const updateUserRole = onCall(
+  callableConfig,
+  async (request: CallableRequest<UpdateUserRoleInput>) => {
+    const data = request.data;
+    const context = { auth: request.auth };
+
     const adminId = await validateSuperAdminAsync(context);
     const userId = validateRequiredString(data.userId, 'userId');
     const newRole = validateRole(data.newRole);
 
     // Prevent changing own role
     if (userId === adminId) {
-      throw new functions.https.HttpsError(
+      throw new HttpsError(
         'failed-precondition',
         'Cannot change your own role'
       );
@@ -129,7 +147,7 @@ export const updateUserRole = functions.region('asia-south1').https.onCall(
 
     const userDoc = await db.collection(Collections.USERS).doc(userId).get();
     if (!userDoc.exists) {
-      throw new functions.https.HttpsError('not-found', 'User not found');
+      throw new HttpsError('not-found', 'User not found');
     }
 
     const user = userDoc.data()!;
@@ -166,8 +184,10 @@ export const updateUserRole = functions.region('asia-south1').https.onCall(
     await auth.setCustomUserClaims(userId, { role: newRole });
 
     // Notify user of role change
-    const roleDisplay = newRole === 'super_admin' ? 'Super Admin' : 
-                        newRole === 'team_admin' ? 'Team Admin' : 'Member';
+    const roleDisplay =
+      newRole === UserRole.SUPER_ADMIN ? 'Super Admin' :
+        newRole === UserRole.TEAM_ADMIN ? 'Team Admin' :
+          'Member';
     await sendNotification(
       userId,
       '🔄 Role Updated',
@@ -183,14 +203,18 @@ export const updateUserRole = functions.region('asia-south1').https.onCall(
  * Revoke a user's access (soft delete - disables account)
  * Only Super Admin can call this function
  */
-export const revokeUserAccess = functions.region('asia-south1').https.onCall(
-  async (data: RevokeUserInput, context) => {
+export const revokeUserAccess = onCall(
+  callableConfig,
+  async (request: CallableRequest<RevokeUserInput>) => {
+    const data = request.data;
+    const context = { auth: request.auth };
+
     const adminId = await validateSuperAdminAsync(context);
     const userId = validateRequiredString(data.userId, 'userId');
 
     // Prevent revoking own access
     if (userId === adminId) {
-      throw new functions.https.HttpsError(
+      throw new HttpsError(
         'failed-precondition',
         'Cannot revoke your own access'
       );
@@ -198,7 +222,7 @@ export const revokeUserAccess = functions.region('asia-south1').https.onCall(
 
     const userDoc = await db.collection(Collections.USERS).doc(userId).get();
     if (!userDoc.exists) {
-      throw new functions.https.HttpsError('not-found', 'User not found');
+      throw new HttpsError('not-found', 'User not found');
     }
 
     // Update user status to revoked
@@ -208,8 +232,8 @@ export const revokeUserAccess = functions.region('asia-south1').https.onCall(
       revokedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
-    // Disable Firebase Auth account
-    await auth.updateUser(userId, { disabled: true });
+    // Disable Firebase Auth account - REMOVED to allow user to see "Access Revoked" screen
+    // await auth.updateUser(userId, { disabled: true });
 
     // Notify user
     await sendNotification(
@@ -227,19 +251,23 @@ export const revokeUserAccess = functions.region('asia-south1').https.onCall(
  * Restore a revoked user's access
  * Only Super Admin can call this function
  */
-export const restoreUserAccess = functions.region('asia-south1').https.onCall(
-  async (data: { userId: string }, context) => {
+export const restoreUserAccess = onCall(
+  callableConfig,
+  async (request: CallableRequest<{ userId: string }>) => {
+    const data = request.data;
+    const context = { auth: request.auth };
+
     const adminId = await validateSuperAdminAsync(context);
     const userId = validateRequiredString(data.userId, 'userId');
 
     const userDoc = await db.collection(Collections.USERS).doc(userId).get();
     if (!userDoc.exists) {
-      throw new functions.https.HttpsError('not-found', 'User not found');
+      throw new HttpsError('not-found', 'User not found');
     }
 
     const user = userDoc.data()!;
     if (user.status !== UserStatus.REVOKED) {
-      throw new functions.https.HttpsError(
+      throw new HttpsError(
         'failed-precondition',
         'User is not in revoked status'
       );
@@ -252,8 +280,14 @@ export const restoreUserAccess = functions.region('asia-south1').https.onCall(
       restoredAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
-    // Re-enable Firebase Auth account
-    await auth.updateUser(userId, { disabled: false });
+    // Re-enable Firebase Auth account (handles legacy revoked users who have disabled accounts)
+    // This is safe to call even if account is not disabled - it will just ensure it's enabled
+    try {
+      await auth.updateUser(userId, { disabled: false });
+    } catch (error) {
+      console.error(`Failed to re-enable auth account for ${userId}:`, error);
+      // Continue anyway - Firestore status is updated, which is most important
+    }
 
     // Notify user
     await sendNotification(
@@ -271,14 +305,18 @@ export const restoreUserAccess = functions.region('asia-south1').https.onCall(
  * Permanently delete a user and cleanup related data
  * Only Super Admin can call this function
  */
-export const deleteUser = functions.region('asia-south1').https.onCall(
-  async (data: DeleteUserInput, context) => {
+export const deleteUser = onCall(
+  callableConfig,
+  async (request: CallableRequest<DeleteUserInput>) => {
+    const data = request.data;
+    const context = { auth: request.auth };
+
     const adminId = await validateSuperAdminAsync(context);
     const userId = validateRequiredString(data.userId, 'userId');
 
     // Prevent deleting own account
     if (userId === adminId) {
-      throw new functions.https.HttpsError(
+      throw new HttpsError(
         'failed-precondition',
         'Cannot delete your own account'
       );
@@ -286,7 +324,7 @@ export const deleteUser = functions.region('asia-south1').https.onCall(
 
     const userDoc = await db.collection(Collections.USERS).doc(userId).get();
     if (!userDoc.exists) {
-      throw new functions.https.HttpsError('not-found', 'User not found');
+      throw new HttpsError('not-found', 'User not found');
     }
 
     const batch = db.batch();
@@ -304,6 +342,50 @@ export const deleteUser = functions.region('asia-south1').https.onCall(
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
     });
+
+    // 1.5. Handle multi-assignee tasks
+    // Find tasks where this user is one of the assignees
+    const multiAssigneeTasks = await db
+      .collection(Collections.TASKS)
+      .where('assigneeIds', 'array-contains', userId)
+      .where('status', '==', TaskStatus.ONGOING)
+      .get();
+
+    for (const doc of multiAssigneeTasks.docs) {
+      const task = doc.data();
+      const currentAssigneeIds: string[] = task.assigneeIds || [];
+      const newAssigneeIds = currentAssigneeIds.filter((id) => id !== userId);
+
+      if (newAssigneeIds.length === 0) {
+        // If no assignees left, cancel the task
+        batch.update(doc.ref, {
+          status: TaskStatus.CANCELLED,
+          cancelReason: 'All assignees deleted',
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      } else {
+        // Just remove this user from assigneeIds
+        batch.update(doc.ref, {
+          assigneeIds: newAssigneeIds,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      }
+
+      // Mark their specific assignment as CANCELLED (or delete it)
+      // We'll mark as CANCELLED to keep history if needed, or deleting is fine too.
+      // Let's cancel it for now to avoid broken refs if referenced elsewhere.
+      const assignmentsQuery = await doc.ref.collection(Collections.ASSIGNMENTS)
+        .where('userId', '==', userId)
+        .get();
+
+      assignmentsQuery.docs.forEach(assignmentDoc => {
+        batch.update(assignmentDoc.ref, {
+          status: 'cancelled', // Using lowercase string or TaskAssignmentStatus.CANCELLED if guaranteed
+          completedAt: admin.firestore.FieldValue.serverTimestamp(), // reusing completedAt or adding cancelledAt
+          completionRemark: 'User account deleted'
+        });
+      });
+    }
 
     // 2. Remove user from all teams
     const teamsSnapshot = await db
@@ -327,9 +409,37 @@ export const deleteUser = functions.region('asia-south1').https.onCall(
     // 3. Delete user document
     batch.delete(db.collection(Collections.USERS).doc(userId));
 
+    // 4. Archive to deleted_users (Audit Log)
+    // We do this BEFORE deleting the main user doc loop essentially, but here we just add to batch
+    const user = userDoc.data()!;
+    batch.set(db.collection('deleted_users').doc(userId), {
+      ...user,
+      deletedAt: admin.firestore.FieldValue.serverTimestamp(),
+      deletedBy: adminId, // Admin deleted
+      deletionReason: 'Admin deleted',
+      originalUserId: userId,
+    });
+
+    // 5. Clean up duplicates by email (The "Zombie" Killer)
+    if (user.email) {
+      const duplicatesSnapshot = await db
+        .collection(Collections.USERS)
+        .where('email', '==', user.email)
+        .get();
+
+      duplicatesSnapshot.docs.forEach((doc) => {
+        if (doc.id !== userId) {
+          console.log(`🗑️ Deleting duplicate/zombie user found for email ${user.email}: ${doc.id}`);
+          batch.delete(doc.ref);
+          // Also archive duplicates? Maybe not necessary, but good for completeness 
+          // batch.set(db.collection('deleted_users').doc(doc.id), { ...doc.data(), deletedBy: 'System (Duplicate Cleanup)' });
+        }
+      });
+    }
+
     await batch.commit();
 
-    // 4. Delete Firebase Auth account
+    // 6. Delete Firebase Auth account
     try {
       await auth.deleteUser(userId);
     } catch (error) {
@@ -341,19 +451,189 @@ export const deleteUser = functions.region('asia-south1').https.onCall(
 );
 
 /**
- * Update user's own profile (name, avatar, notification preferences)
- * Any authenticated user can update their own profile
+ * Delete own account and all associated data
+ * Any authenticated user can delete their own account (Play Store compliance)
  */
-export const updateProfile = functions.region('asia-south1').https.onCall(
-  async (data: { name?: string; avatarUrl?: string; notificationPreferences?: Record<string, boolean> }, context) => {
-    if (!context.auth) {
-      throw new functions.https.HttpsError(
-        'unauthenticated',
-        'Must be authenticated to update profile'
+export const deleteOwnAccount = onCall(
+  callableConfig,
+  async (request: CallableRequest<unknown>) => {
+    const context = { auth: request.auth };
+
+    const userId = validateAuthenticated(context);
+
+    const userDoc = await db.collection(Collections.USERS).doc(userId).get();
+    if (!userDoc.exists) {
+      throw new HttpsError('not-found', 'User not found');
+    }
+
+    const user = userDoc.data()!;
+
+    // Super admins cannot delete themselves (safety measure)
+    if (user.role === UserRole.SUPER_ADMIN) {
+      throw new HttpsError(
+        'failed-precondition',
+        'Super Admin accounts cannot be self-deleted. Contact another Super Admin.'
       );
     }
 
-    const userId = context.auth.uid;
+    const batch = db.batch();
+
+    // 1. Cancel all ongoing tasks assigned to this user
+    const assignedTasks = await db
+      .collection(Collections.TASKS)
+      .where('assignedTo', '==', userId)
+      .where('status', '==', TaskStatus.ONGOING)
+      .get();
+
+    assignedTasks.docs.forEach((doc: admin.firestore.QueryDocumentSnapshot) => {
+      batch.update(doc.ref, {
+        status: TaskStatus.CANCELLED,
+        cancelReason: 'User account deleted',
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    });
+
+    // 1.5. Handle multi-assignee tasks
+    // Find tasks where this user is one of the assignees
+    const multiAssigneeTasks = await db
+      .collection(Collections.TASKS)
+      .where('assigneeIds', 'array-contains', userId)
+      .where('status', '==', TaskStatus.ONGOING)
+      .get();
+
+    for (const doc of multiAssigneeTasks.docs) {
+      const task = doc.data();
+      const currentAssigneeIds: string[] = task.assigneeIds || [];
+      const newAssigneeIds = currentAssigneeIds.filter((id) => id !== userId);
+
+      if (newAssigneeIds.length === 0) {
+        // If no assignees left, cancel the task
+        batch.update(doc.ref, {
+          status: TaskStatus.CANCELLED,
+          cancelReason: 'Last assignee deleted account',
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      } else {
+        // Just remove this user from assigneeIds
+        batch.update(doc.ref, {
+          assigneeIds: newAssigneeIds,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      }
+
+      // Mark their specific assignment as CANCELLED
+      const assignmentsQuery = await doc.ref.collection(Collections.ASSIGNMENTS)
+        .where('userId', '==', userId)
+        .get();
+
+      assignmentsQuery.docs.forEach(assignmentDoc => {
+        batch.update(assignmentDoc.ref, {
+          status: 'cancelled',
+          completedAt: admin.firestore.FieldValue.serverTimestamp(),
+          completionRemark: 'User account deleted'
+        });
+      });
+    }
+
+    // 2. Remove user from all teams
+    const teamsSnapshot = await db
+      .collection(Collections.TEAMS)
+      .where('memberIds', 'array-contains', userId)
+      .get();
+
+    teamsSnapshot.docs.forEach((doc: admin.firestore.QueryDocumentSnapshot) => {
+      const team = doc.data();
+      const memberIds = team.memberIds.filter((id: string) => id !== userId);
+      const updates: Record<string, unknown> = { memberIds };
+
+      // If user was team admin, clear adminId
+      if (team.adminId === userId) {
+        updates.adminId = null;
+      }
+
+      batch.update(doc.ref, updates);
+    });
+
+    // 3. Delete user's notifications
+    const notifications = await db
+      .collection(Collections.NOTIFICATIONS)
+      .where('userId', '==', userId)
+      .get();
+
+    notifications.docs.forEach((doc: admin.firestore.QueryDocumentSnapshot) => {
+      batch.delete(doc.ref);
+    });
+
+    // 4. Delete user's remarks
+    const remarks = await db
+      .collection(Collections.REMARKS)
+      .where('userId', '==', userId)
+      .get();
+
+    remarks.docs.forEach((doc: admin.firestore.QueryDocumentSnapshot) => {
+      batch.delete(doc.ref);
+    });
+
+    // 5. Delete user document
+    batch.delete(db.collection(Collections.USERS).doc(userId));
+
+    // 6. Archive to deleted_users (Audit Log)
+    batch.set(db.collection('deleted_users').doc(userId), {
+      ...user,
+      deletedAt: admin.firestore.FieldValue.serverTimestamp(),
+      deletedBy: userId, // Self deleted
+      deletionReason: 'User self-deleted',
+      originalUserId: userId,
+    });
+
+    // 7. Clean up duplicates by email (The "Zombie" Killer)
+    if (user.email) {
+      const duplicatesSnapshot = await db
+        .collection(Collections.USERS)
+        .where('email', '==', user.email)
+        .get();
+
+      duplicatesSnapshot.docs.forEach((doc) => {
+        if (doc.id !== userId) {
+          console.log(`🗑️ Deleting duplicate/zombie user found for email ${user.email}: ${doc.id}`);
+          batch.delete(doc.ref);
+        }
+      });
+    }
+
+    await batch.commit();
+
+    // 8. Delete Firebase Auth account
+    try {
+      await auth.deleteUser(userId);
+    } catch (error) {
+      console.error(`Failed to delete auth account for ${userId}:`, error);
+    }
+
+    console.log(`✅ User ${userId} deleted their own account`);
+
+    return { success: true, message: 'Account and data deleted successfully' };
+  }
+);
+
+/**
+ * Update user's own profile (name, avatar, notification preferences)
+ * Any authenticated user can update their own profile
+ */
+interface UpdateProfileInput {
+  name?: string;
+  avatarUrl?: string;
+  notificationPreferences?: Record<string, boolean>;
+}
+
+export const updateProfile = onCall(
+  callableConfig,
+  async (request: CallableRequest<UpdateProfileInput>) => {
+    const data = request.data;
+    const context = { auth: request.auth };
+
+    const userId = validateAuthenticated(context);
+
     const updates: Record<string, unknown> = {
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     };
@@ -362,12 +642,13 @@ export const updateProfile = functions.region('asia-south1').https.onCall(
     if (data.name !== undefined) {
       const trimmedName = data.name.trim();
       if (trimmedName.length < 2 || trimmedName.length > 50) {
-        throw new functions.https.HttpsError(
+        throw new HttpsError(
           'invalid-argument',
           'Name must be between 2 and 50 characters'
         );
       }
       updates.name = trimmedName;
+      updates.needsOnboarding = false; // Mark onboarding as complete when name is set
     }
 
     // Add avatar URL if provided
@@ -382,7 +663,7 @@ export const updateProfile = functions.region('asia-south1').https.onCall(
 
     // Check if there are any updates to make
     if (Object.keys(updates).length === 1) {
-      throw new functions.https.HttpsError(
+      throw new HttpsError(
         'invalid-argument',
         'No valid updates provided'
       );

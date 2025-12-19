@@ -1,4 +1,4 @@
-import * as functions from 'firebase-functions';
+import { onCall, HttpsError, CallableRequest } from 'firebase-functions/v2/https';
 import { admin, db } from '../config/firebase-admin';
 import { Collections, UserRole, TaskStatus, NotificationType } from '../config/constants';
 import {
@@ -13,12 +13,19 @@ import {
 } from '../services/notificationService';
 import { CreateTeamInput, UpdateTeamInput, DeleteTeamInput } from '../types';
 
+// 2nd Gen configuration for callable functions
+const callableConfig = { region: 'asia-south1', concurrency: 80 };
+
 /**
  * Create a new team
  * Only Super Admin can call this function
  */
-export const createTeam = functions.region('asia-south1').https.onCall(
-  async (data: CreateTeamInput, context) => {
+export const createTeam = onCall(
+  callableConfig,
+  async (request: CallableRequest<CreateTeamInput>) => {
+    const data = request.data;
+    const context = { auth: request.auth };
+
     const adminId = validateSuperAdmin(context);
     const name = validateRequiredString(data.name, 'Team name');
     const memberIds = validateNonEmptyArray<string>(data.memberIds, 'memberIds');
@@ -26,7 +33,7 @@ export const createTeam = functions.region('asia-south1').https.onCall(
 
     // Validate team admin is in members list
     if (!memberIds.includes(teamAdminId)) {
-      throw new functions.https.HttpsError(
+      throw new HttpsError(
         'invalid-argument',
         'Team admin must be in the members list'
       );
@@ -36,14 +43,14 @@ export const createTeam = functions.region('asia-south1').https.onCall(
     for (const memberId of memberIds) {
       const userDoc = await db.collection(Collections.USERS).doc(memberId).get();
       if (!userDoc.exists) {
-        throw new functions.https.HttpsError(
+        throw new HttpsError(
           'not-found',
           `User ${memberId} not found`
         );
       }
       const user = userDoc.data()!;
       if (user.status !== 'active') {
-        throw new functions.https.HttpsError(
+        throw new HttpsError(
           'failed-precondition',
           `User ${memberId} is not active`
         );
@@ -84,14 +91,18 @@ export const createTeam = functions.region('asia-south1').https.onCall(
  * Update a team (name, members, admin)
  * Super Admin or Team Admin can call this function
  */
-export const updateTeam = functions.region('asia-south1').https.onCall(
-  async (data: UpdateTeamInput, context) => {
+export const updateTeam = onCall(
+  callableConfig,
+  async (request: CallableRequest<UpdateTeamInput>) => {
+    const data = request.data;
+    const context = { auth: request.auth };
+
     const callerId = validateAuthenticated(context);
     const teamId = validateRequiredString(data.teamId, 'teamId');
     const updates = data.updates;
 
     if (!updates || Object.keys(updates).length === 0) {
-      throw new functions.https.HttpsError(
+      throw new HttpsError(
         'invalid-argument',
         'No updates provided'
       );
@@ -99,7 +110,7 @@ export const updateTeam = functions.region('asia-south1').https.onCall(
 
     const teamDoc = await db.collection(Collections.TEAMS).doc(teamId).get();
     if (!teamDoc.exists) {
-      throw new functions.https.HttpsError('not-found', 'Team not found');
+      throw new HttpsError('not-found', 'Team not found');
     }
 
     const team = teamDoc.data()!;
@@ -108,7 +119,7 @@ export const updateTeam = functions.region('asia-south1').https.onCall(
     const isTeamAdmin = team.adminId === callerId;
 
     if (!(isSuperAdmin || isTeamAdmin)) {
-      throw new functions.https.HttpsError(
+      throw new HttpsError(
         'permission-denied',
         'Only Super Admin or Team Admin can update this team'
       );
@@ -131,7 +142,7 @@ export const updateTeam = functions.region('asia-south1').https.onCall(
       const currentMembers = updates.memberIds || team.memberIds;
 
       if (!currentMembers.includes(newAdminId)) {
-        throw new functions.https.HttpsError(
+        throw new HttpsError(
           'invalid-argument',
           'New admin must be a team member'
         );
@@ -148,7 +159,7 @@ export const updateTeam = functions.region('asia-south1').https.onCall(
       // Validate new admin is in new members list
       const finalAdminId = updates.adminId || team.adminId;
       if (finalAdminId && !newMemberIds.includes(finalAdminId)) {
-        throw new functions.https.HttpsError(
+        throw new HttpsError(
           'invalid-argument',
           'Team admin must remain in the members list'
         );
@@ -205,14 +216,18 @@ export const updateTeam = functions.region('asia-south1').https.onCall(
  * Delete a team and cleanup related data
  * Only Super Admin can call this function
  */
-export const deleteTeam = functions.region('asia-south1').https.onCall(
-  async (data: DeleteTeamInput, context) => {
+export const deleteTeam = onCall(
+  callableConfig,
+  async (request: CallableRequest<DeleteTeamInput>) => {
+    const context = { auth: request.auth };
+    const data = request.data;
+
     validateSuperAdmin(context);
     const teamId = validateRequiredString(data.teamId, 'teamId');
 
     const teamDoc = await db.collection(Collections.TEAMS).doc(teamId).get();
     if (!teamDoc.exists) {
-      throw new functions.https.HttpsError('not-found', 'Team not found');
+      throw new HttpsError('not-found', 'Team not found');
     }
 
     const team = teamDoc.data()!;
