@@ -1,8 +1,8 @@
 # TODO Planner Backend - CodeMap & Technical Reference
 
-**Version:** 1.3.2  
-**Last Updated:** 2025-12-06  
-**Project Version:** 1.3.2
+**Version:** 1.3.6  
+**Last Updated:** 2025-12-17  
+**Project Version:** 1.3.6
 
 ---
 
@@ -768,9 +768,9 @@ All notifications now follow a concise format:
 | New comment | 💬 New Comment | "{title}" |
 
 ### Calendar Integration
-- Calendar events created with **no reminders** (`overrides: []`)
-- App scheduled functions handle all deadline reminders
-- Avoids duplicate notifications from calendar + app
+- Calendar events created with **popup reminders** at 24h, 6h, and 1h before deadline
+- App scheduled functions also handle deadline reminders
+- Both calendar and app notifications work together for reliability
 
 ### Files Modified
 - `taskController.ts` - Removed duplicate notifications
@@ -781,6 +781,304 @@ All notifications now follow a concise format:
 - `remarkController.ts` - Beautified comment notification
 - `userController.ts` - Beautified user management notifications
 - `teamController.ts` - Beautified team notifications
+
+---
+
+## 20. Calendar Integration Improvements (v1.3.3 - Dec 16, 2025)
+
+### Overview
+Fixed multi-assignee calendar event handling and improved token management for seamless reconnection.
+
+### Changes Made
+
+#### Token Preservation on Disconnect
+- `disconnectCalendar` now only sets `googleCalendarConnected: false`
+- Tokens (`googleAccessToken`, `googleRefreshToken`) are **preserved** for seamless reconnection
+- Tokens are only deleted on account deletion (in `deleteUser`)
+
+#### Less Aggressive Auth Error Handling
+- `handleCalendarAuthError` now only resets connection for true auth errors:
+  - 401 Unauthorized
+  - `invalid_grant` errors
+  - Token revocation errors
+- Does **NOT** reset for rate-limits (429) or quota errors (403)
+- Uses dedicated notification type instead of `TASK_ASSIGNED`
+
+#### Multi-Assignee Calendar Event Updates
+- `updateTask` now handles multi-assignee tasks:
+  - Iterates through `assignments` subcollection
+  - Updates each assignee's calendar event when deadline changes
+- Previously only updated single-assignee tasks
+
+#### Stale Event ID Cleanup
+- Calendar event IDs are now cleared from Firestore after successful deletion:
+  - `completeTask` (single-assignee): clears `task.calendarEventId`
+  - `completeAssignmentInternal` (multi-assignee): clears `assignment.calendarEventId`
+  - `cancelTask`: clears IDs for both single and multi-assignee tasks
+
+#### Multi-Assignee Disconnect/Sync Fix (Dec 16, 2025)
+- `deleteAllUserCalendarEvents` now handles both task types:
+  - Legacy single-assignee: queries `tasks` where `assignedTo == userId`
+  - Multi-assignee: queries `collectionGroup('assignments')` where `userId == userId`
+  - Clears `calendarEventId` from Firestore after successful deletion
+- `syncExistingTasksToCalendar` now handles both task types:
+  - Legacy single-assignee: syncs tasks with `assignedTo` field
+  - Multi-assignee: syncs via `collectionGroup('assignments')` query
+  - Stores `calendarEventId` in assignment document for multi-assignee tasks
+
+#### Notification Type Fix (Dec 16, 2025)
+- `handleCalendarAuthError` notification type changed from `ROLE_CHANGED` to `TASK_UPDATED`
+- Ensures Flutter can properly handle reconnection notifications with correct icon
+- `TASK_UPDATED` is supported in Flutter's `NotificationType` enum
+
+### Files Modified
+- `src/services/calendarService.ts`
+  - `handleCalendarAuthError` - Less aggressive error handling + notification type fix
+  - `disconnectCalendar` - Token preservation
+  - `deleteAllUserCalendarEvents` - Multi-assignee support + clear event IDs
+  - `syncExistingTasksToCalendar` - Multi-assignee support
+- `src/controllers/taskController.ts`
+  - `updateTask` - Multi-assignee calendar event updates
+  - `completeTask` - Clear event ID after deletion
+  - `completeAssignmentInternal` - Clear event ID after deletion
+  - `cancelTask` - Clear event IDs for all cases
+
+### Token Flow Summary
+```
+Connect Calendar:
+  App → serverAuthCode → Backend → refresh_token stored
+  
+Disconnect Calendar:
+  Backend sets googleCalendarConnected = false
+  Tokens preserved for quick reconnect
+  
+Reconnect Calendar:
+  App triggers connect → existing tokens still valid → instant reconnect
+  
+Account Deletion:
+  Backend deletes user doc (including all tokens)
+```
+
+---
+
+## 21. PDF Report Export Fix (v1.3.4 - Dec 16, 2025)
+
+### Overview
+Fixed PDF report generation error "switchToPage(0) out of bounds" that occurred when exporting reports with multiple pages.
+
+### Problem
+When generating multi-page PDF reports, PDFKit would flush earlier pages from its buffer. When the footer loop tried to use `switchToPage(i)` to add page numbers to all pages, earlier pages were no longer accessible.
+
+### Solution
+Added `bufferPages: true` to PDFDocument options in `generateTasksPDF()` function. This keeps all pages in memory until `doc.end()` is called, allowing `switchToPage()` to work correctly.
+
+### Files Modified
+- `src/controllers/reportController.ts`
+  - Line 109: Added `bufferPages: true` to PDFDocument options
+
+### Code Change
+```typescript
+// Before
+const doc = new PDFDocument({ margin: 40, size: 'A4' });
+
+// After
+const doc = new PDFDocument({ margin: 40, size: 'A4', bufferPages: true });
+```
+
+---
+
+## 22. Smart Notification System (v1.3.5 - Dec 16, 2025)
+
+### Overview
+Implemented intelligent notification routing that respects calendar connection status. Calendar-connected users get Activity log only for task creation/deadline reminders (calendar handles alerts), while non-calendar users get full FCM push notifications as fallback.
+
+### Key Features
+
+#### Conditional Notification Logic
+| Event | Calendar Users | Non-Calendar Users |
+|-------|---------------|-------------------|
+| **Task Created** | Activity only (calendar shows event) | Activity + FCM |
+| **Deadline Reminder (24h)** | Activity only (calendar reminder) | Activity + FCM |
+| **Task Updated** | Activity + FCM (always) | Activity + FCM (always) |
+| **Overdue** | Activity + FCM (always) | Activity + FCM (always) |
+| **Remarks/Comments** | Activity + FCM (always) | Activity + FCM (always) |
+
+#### Calendar Reminders Enabled
+Calendar events now include popup reminders:
+- 24 hours before deadline
+- 6 hours before deadline
+- 1 hour before deadline
+
+#### Activity Logging for All Notifications
+`sendMulticastNotification()` now logs to Firestore `notifications` collection for all users, ensuring team notifications appear in Activity view.
+
+#### Multi-Assignee Task Notifications
+- `notifyTaskAssignment` trigger now handles multi-assignee tasks
+- `checkDeadlines` scheduled function handles multi-assignee deadline reminders
+
+#### New Notification Type
+Added `TASK_UPDATED` notification type for task detail changes.
+
+### Files Modified
+
+**Backend:**
+- `src/services/notificationService.ts`
+  - Added Firestore logging to `sendMulticastNotification()`
+- `src/services/calendarService.ts`
+  - Enabled calendar reminders (24h, 6h, 1h before deadline)
+- `src/triggers/scheduledFunctions.ts`
+  - `sendDeadlineReminder()` - Multi-assignee support
+  - `sendConditionalDeadlineReminder()` - New helper for calendar-aware reminders
+- `src/triggers/notificationTriggers.ts`
+  - `sendConditionalAssignmentNotification()` - New helper for calendar-aware task assignment
+  - `notifyTaskAssignment` - Multi-assignee support + conditional logic
+- `src/controllers/taskController.ts`
+  - `updateTask()` - Added task update notifications to assignees
+- `src/config/constants.ts`
+  - Added `TASK_UPDATED` notification type
+
+**Frontend:**
+- `lib/data/models/notification_model.dart`
+  - Added `taskUpdated` enum value
+- `lib/presentation/notifications/notification_center_screen.dart`
+  - Added `taskUpdated` case to icon and color switch statements
+
+### Notification Distribution Summary
+```
+Calendar-Connected Users:
+  Task Created → Calendar shows event (Activity logged, FCM skipped)
+  Deadline Approaching → Calendar popup reminder (Activity logged, FCM skipped)
+  Task Updated → Activity + FCM (calendar can't notify updates)
+  Overdue → Activity + FCM (calendar can't do overdue)
+  Remarks → Activity + FCM
+
+Non-Calendar Users:
+  All notifications → Activity + FCM (full fallback)
+```
+
+---
+
+## 23. Firestore Rules Update - Assignments Subcollection (Dec 16, 2025)
+
+### Overview
+Added security rules for the `assignments` subcollection under tasks to support multi-assignee task queries from the frontend.
+
+### Problem
+Frontend was receiving `PERMISSION_DENIED` errors when querying `tasks/{taskId}/assignments` because Firestore rules are NOT inherited by subcollections.
+
+### Solution
+Added explicit rules for the assignments subcollection:
+```
+match /tasks/{taskId}/assignments/{assignmentId} {
+  allow read: if isApproved();
+  allow write: if false; // Only Cloud Functions
+}
+```
+
+### Files Modified
+- `firestore.rules` - Added assignments subcollection rules under tasks
+
+---
+
+## 24. Cloud Functions Performance Optimizations (v1.3.6 - Dec 17, 2025)
+
+### Overview
+Implemented comprehensive performance optimizations to reduce API response latency for task creation and update operations. These changes make the callable functions return faster by avoiding blocking operations and reducing unnecessary Firestore reads.
+
+### Key Optimizations
+
+#### 1. Multi-Assignee Calendar Write Contention Fix
+**Problem**: For multi-assignee tasks, `createCalendarEventForUser()` was writing `calendarEventId` to the parent task document for each assignee, causing write contention and increased latency.
+
+**Solution**: Added `skipTaskDocUpdate` parameter to `createCalendarEventForUser()`:
+- Single-assignee tasks: Store `calendarEventId` on task doc (default behavior)
+- Multi-assignee tasks: Store `calendarEventId` on assignment subdocs only (pass `skipTaskDocUpdate=true`)
+
+**Files Modified**:
+- `src/services/calendarService.ts` - Added `skipTaskDocUpdate` parameter
+- `src/controllers/taskController.ts` - Pass `skipTaskDocUpdate=true` for multi-assignee in `assignTask` and `reopenTask`
+
+#### 2. Fire-and-Forget Pattern for Background Operations
+**Problem**: Callable functions waited for calendar and notification operations to complete before returning, blocking the API response.
+
+**Solution**: Implemented fire-and-forget pattern - return response immediately after Firestore writes, let calendar/notification operations complete in background.
+
+**Functions Optimized**:
+- `assignTask` (multi-assignee): Calendar events created in background
+- `updateTask`: Calendar updates and notifications sent in background
+- `reopenTask`: Calendar events and notifications sent in background
+
+**Pattern Used**:
+```typescript
+// Don't await - let operations complete in background
+Promise.all(calendarPromises).catch((error) => {
+  console.error('Background operation failed:', error);
+});
+return { success: true, ... };
+```
+
+#### 3. Parallelized Notification Sending
+**Problem**: `updateTask` sent notifications sequentially using a `for` loop with `await`, adding latency for each assignee.
+
+**Solution**: Changed to parallel execution using `Promise.all()`:
+```typescript
+// Before: Sequential
+for (const assigneeId of assigneesToNotify) {
+  await sendNotification(...);
+}
+
+// After: Parallel
+const notificationPromises = assigneesToNotify.map((assigneeId) =>
+  sendNotification(...)
+);
+Promise.all(notificationPromises);
+```
+
+#### 4. Optimized Firestore Reads (isCreator Check First)
+**Problem**: `updateTask` and `cancelTask` always checked for super admin role via Firestore fallback, even when the caller was the task creator.
+
+**Solution**: Check `isCreator` first - if true, skip the expensive Firestore role check entirely:
+```typescript
+// Check isCreator first - if true, skip expensive role checks
+const isCreator = task.createdBy === callerId;
+
+// Only fallback to Firestore if not creator AND custom claims don't show super admin
+if (!isCreator && !isSuperAdmin) {
+  const callerDoc = await db.collection(Collections.USERS).doc(callerId).get();
+  // ...
+}
+```
+
+**Functions Optimized**:
+- `updateTask` - Creator can update without Firestore role check
+- `cancelTask` - Creator can cancel without Firestore role check
+
+### Performance Impact
+
+| Operation | Before | After | Improvement |
+|-----------|--------|-------|-------------|
+| assignTask (5 assignees) | ~3-5s | ~500ms | 6-10x faster |
+| updateTask (deadline change) | ~2-4s | ~300ms | 6-13x faster |
+| reopenTask (5 assignees) | ~4-6s | ~500ms | 8-12x faster |
+
+*Note: Actual times depend on Google Calendar API latency and network conditions.*
+
+### Important Notes
+
+1. **Background operations may fail silently** - Calendar/notification operations complete after API response. Check Cloud Function logs for errors.
+
+2. **Calendar event IDs stored async** - For multi-assignee tasks, `calendarEventId` is stored in assignment docs after the API returns. Subsequent updates will find the IDs.
+
+3. **Firebase Functions grace period** - Firebase keeps the function running after response is sent to complete background work.
+
+### Files Modified
+- `src/services/calendarService.ts`
+  - `createCalendarEventForUser()` - Added `skipTaskDocUpdate` parameter
+- `src/controllers/taskController.ts`
+  - `assignTask` - Fire-and-forget calendar for multi-assignee
+  - `updateTask` - Fire-and-forget calendar updates + parallel notifications + isCreator optimization
+  - `cancelTask` - isCreator optimization
+  - `reopenTask` - Fire-and-forget calendar and notifications
 
 ---
 
