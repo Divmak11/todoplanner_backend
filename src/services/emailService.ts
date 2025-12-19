@@ -1,4 +1,4 @@
-import * as functions from 'firebase-functions';
+import * as functions from 'firebase-functions/v1';
 
 // SendGrid will be configured via Firebase Functions config
 // Run: firebase functions:config:set sendgrid.key="YOUR_API_KEY" sendgrid.from="your-email@domain.com"

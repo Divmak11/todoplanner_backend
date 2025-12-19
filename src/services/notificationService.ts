@@ -92,6 +92,18 @@ export async function sendMulticastNotification(
 ): Promise<void> {
   if (userIds.length === 0) return;
 
+  // Extract type and taskId from data for activity log
+  const notificationType = data?.type as NotificationTypeType | undefined;
+  const taskId = data?.taskId;
+
+  // Save to Firestore for Activity tab for ALL users (always, even if no FCM token)
+  if (notificationType) {
+    const activityPromises = userIds.map((userId) =>
+      saveNotificationToFirestore(userId, notificationType, title, body, taskId)
+    );
+    await Promise.all(activityPromises);
+  }
+
   // Batch get users in chunks of 10 (Firestore limit for 'in' queries)
   const tokens: string[] = [];
   const chunks = chunkArray(userIds, 10);
