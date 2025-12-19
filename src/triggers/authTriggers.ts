@@ -1,4 +1,4 @@
-import * as functions from 'firebase-functions';
+import * as functions from 'firebase-functions/v1';
 import { admin, db, auth } from '../config/firebase-admin';
 import {
   Collections,
@@ -79,6 +79,7 @@ export const createUserProfile = functions.region('asia-south1').auth.user().onC
     role,
     teamIds: [],
     status,
+    needsOnboarding: true, // Flag to indicate user needs to set their preferred name
     googleCalendarConnected: false,
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
     lastActive: admin.firestore.FieldValue.serverTimestamp(),

@@ -1,4 +1,4 @@
-import * as functions from 'firebase-functions';
+import { onSchedule } from 'firebase-functions/v2/scheduler';
 import { admin, db } from '../config/firebase-admin';
 import { Collections, TaskStatus, NotificationType } from '../config/constants';
 import {
@@ -7,13 +7,16 @@ import {
   createNotificationData,
 } from '../services/notificationService';
 
+// 2nd Gen configuration for scheduled functions
+const scheduleConfig = { region: 'asia-south1', timeZone: 'Asia/Kolkata' };
+
 /**
  * Scheduled function: Check for upcoming deadlines and send reminders
  * Runs every hour
  */
-export const checkDeadlines = functions.region('asia-south1').pubsub
-  .schedule('every 1 hours')
-  .onRun(async () => {
+export const checkDeadlines = onSchedule(
+  { schedule: 'every 1 hours', ...scheduleConfig },
+  async () => {
     const now = admin.firestore.Timestamp.now();
     const nowMs = now.toMillis();
 
@@ -48,31 +51,71 @@ export const checkDeadlines = functions.region('asia-south1').pubsub
     await Promise.all(reminderPromises);
 
     console.log(`Deadline check completed. Processed ${ongoingTasks.size} tasks.`);
-  });
+  }
+);
 
 /**
  * Helper: Send 24-hour deadline reminder to assignee and creator
+ * Only sends FCM push to users without calendar connected (calendar handles reminders for connected users)
+ * Always logs to Activity for all users
  */
 async function sendDeadlineReminder(
   taskId: string,
   task: admin.firestore.DocumentData
 ): Promise<void> {
-  // Notify assignee
-  await sendNotification(
-    task.assignedTo,
-    '⏰ Due Tomorrow',
-    `"${task.title}"`,
-    createNotificationData(NotificationType.TASK_OVERDUE, { taskId })
-  );
+  // Handle multi-assignee tasks
+  if (task.isMultiAssignee && task.assigneeIds?.length > 0) {
+    const assigneeIds: string[] = task.assigneeIds;
+    for (const assigneeId of assigneeIds) {
+      await sendConditionalDeadlineReminder(assigneeId, taskId, task.title, false);
+    }
+  } else if (task.assignedTo) {
+    // Single-assignee task
+    await sendConditionalDeadlineReminder(task.assignedTo, taskId, task.title, false);
+  }
 
-  // Notify creator (if different from assignee)
-  if (task.createdBy !== task.assignedTo) {
-    await sendNotification(
-      task.createdBy,
-      '⏰ Due Tomorrow',
-      `"${task.title}" assigned to team member`,
-      createNotificationData(NotificationType.TASK_OVERDUE, { taskId })
-    );
+  // Notify creator (if different from all assignees)
+  const allAssignees = task.isMultiAssignee ? (task.assigneeIds || []) : [task.assignedTo];
+  if (task.createdBy && !allAssignees.includes(task.createdBy)) {
+    await sendConditionalDeadlineReminder(task.createdBy, taskId, task.title, true);
+  }
+}
+
+/**
+ * Helper: Send deadline reminder conditionally based on calendar connection
+ * - Always logs to Activity (Firestore notifications collection)
+ * - Only sends FCM push if user has no calendar connected
+ */
+async function sendConditionalDeadlineReminder(
+  userId: string,
+  taskId: string,
+  taskTitle: string,
+  isCreator: boolean
+): Promise<void> {
+  // Check if user has calendar connected
+  const userDoc = await db.collection(Collections.USERS).doc(userId).get();
+  const user = userDoc.data();
+  const hasCalendar = user?.googleCalendarConnected === true;
+
+  const title = '⏰ Due Tomorrow';
+  const body = isCreator ? `"${taskTitle}" assigned to team member` : `"${taskTitle}"`;
+  const data = createNotificationData(NotificationType.TASK_OVERDUE, { taskId });
+
+  if (hasCalendar) {
+    // User has calendar - only log to Activity, skip FCM (calendar handles reminders)
+    await db.collection('notifications').add({
+      userId,
+      type: NotificationType.TASK_OVERDUE,
+      title,
+      message: body,
+      taskId,
+      isRead: false,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    console.log(`Activity log saved for calendar user ${userId} (FCM skipped)`);
+  } else {
+    // No calendar - send full notification (Activity + FCM)
+    await sendNotification(userId, title, body, data);
   }
 }
 
@@ -80,10 +123,9 @@ async function sendDeadlineReminder(
  * Scheduled function: Check for overdue tasks
  * Runs daily at 9 AM
  */
-export const checkOverdueTasks = functions.region('asia-south1').pubsub
-  .schedule('0 9 * * *')
-  .timeZone('Asia/Kolkata')
-  .onRun(async () => {
+export const checkOverdueTasks = onSchedule(
+  { schedule: '0 9 * * *', ...scheduleConfig },
+  async () => {
     const now = admin.firestore.Timestamp.now();
 
     // Get all overdue ongoing tasks
@@ -188,17 +230,46 @@ export const checkOverdueTasks = functions.region('asia-south1').pubsub
     }
 
     console.log(`Overdue check completed. Found ${overdueTasks.size} overdue tasks.`);
-  });
+  }
+);
 
 /**
- * Scheduled function: Update user last active timestamp
- * Runs daily to clean up inactive users tracking
+ * Scheduled function: Daily cleanup
+ * Runs daily at midnight
  */
-export const cleanupInactiveTracking = functions.region('asia-south1').pubsub
-  .schedule('0 0 * * *')
-  .timeZone('Asia/Kolkata')
-  .onRun(async () => {
+export const cleanupInactiveTracking = onSchedule(
+  { schedule: '0 0 * * *', ...scheduleConfig },
+  async () => {
     // This is a placeholder for any cleanup tasks
     // Could be used to archive old data, clean up orphaned records, etc.
     console.log('Daily cleanup completed.');
-  });
+  }
+);
+
+/**
+ * Scheduled function: Keep critical functions warm
+ * Runs every 5 minutes to prevent cold starts on user-facing functions
+ * This warms the Node.js runtime, Firebase Admin SDK, and Firestore connection
+ */
+export const keepCriticalFunctionsWarm = onSchedule(
+  { schedule: 'every 5 minutes', ...scheduleConfig },
+  async () => {
+    // Make minimal Firestore read to warm DB connection
+    // This warms the same infrastructure that callable functions use
+    const warmupDoc = await db.collection('_warmup').doc('ping').get();
+
+    if (!warmupDoc.exists) {
+      // Create warmup doc if it doesn't exist
+      await db.collection('_warmup').doc('ping').set({
+        lastPing: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    } else {
+      // Update timestamp to prove activity
+      await db.collection('_warmup').doc('ping').update({
+        lastPing: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    }
+
+    console.log('🔥 Warm-up ping executed at', new Date().toISOString());
+  }
+);
