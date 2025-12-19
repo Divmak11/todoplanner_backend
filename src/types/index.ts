@@ -3,6 +3,7 @@ import {
   UserRoleType,
   UserStatusType,
   TaskStatusType,
+  TaskAssignmentStatusType,
   AssignmentTypeType,
   ApprovalRequestTypeType,
   ApprovalStatusType,
@@ -45,21 +46,41 @@ export interface Team {
   updatedBy?: string;
 }
 
-// Task Types
+// Task Types (supports both old single-assignee and new multi-assignee structure)
 export interface Task {
   id: string;
   title: string;
   subtitle: string;
   assignedType: AssignmentTypeType;
-  assignedTo: string;
   createdBy: string;
   status: TaskStatusType;
   deadline: firestore.Timestamp;
-  calendarEventId?: string;
   createdAt: firestore.Timestamp;
   updatedAt: firestore.Timestamp;
+
+  // Legacy single-assignee fields (for backward compatibility)
+  assignedTo?: string;
+  calendarEventId?: string;
   completedAt?: firestore.Timestamp;
   completionRemark?: string;
+
+  // New multi-assignee fields
+  isMultiAssignee?: boolean;
+  assigneeIds?: string[];
+  supervisorIds?: string[];
+  taskGroupId?: string;
+  sourceTeamId?: string;
+}
+
+// Task Assignment (subcollection under tasks for multi-assignee tasks)
+export interface TaskAssignment {
+  id: string;
+  userId: string;
+  status: TaskAssignmentStatusType;
+  assignedAt: firestore.Timestamp;
+  completedAt?: firestore.Timestamp;
+  completionRemark?: string;
+  calendarEventId?: string;
 }
 
 // Remark Types
@@ -146,8 +167,9 @@ export interface AssignTaskInput {
   title: string;
   subtitle: string;
   assignedType: AssignmentTypeType;
-  assignedTo: string;
+  assignedTo: string | string[]; // Single ID or array for multiple assignees
   deadline: string; // ISO string
+  supervisorIds?: string[]; // Users who can see all assignees' completion status
 }
 
 export interface UpdateTaskInput {
@@ -160,6 +182,12 @@ export interface UpdateTaskInput {
 }
 
 export interface CompleteTaskInput {
+  taskId: string;
+  remark?: string;
+}
+
+// Complete assignment for multi-assignee tasks
+export interface CompleteAssignmentInput {
   taskId: string;
   remark?: string;
 }

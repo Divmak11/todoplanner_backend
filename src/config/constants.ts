@@ -25,6 +25,14 @@ export const TaskStatus = {
 
 export type TaskStatusType = typeof TaskStatus[keyof typeof TaskStatus];
 
+// Task Assignment Status (for multi-assignee per-user tracking)
+export const TaskAssignmentStatus = {
+  ONGOING: 'ongoing',
+  COMPLETED: 'completed',
+} as const;
+
+export type TaskAssignmentStatusType = typeof TaskAssignmentStatus[keyof typeof TaskAssignmentStatus];
+
 // Assignment Types
 export const AssignmentType = {
   MEMBER: 'member',
@@ -65,10 +73,12 @@ export const Collections = {
   USERS: 'users',
   TEAMS: 'teams',
   TASKS: 'tasks',
+  ASSIGNMENTS: 'assignments', // Subcollection under tasks for multi-assignee per-user tracking
   REMARKS: 'remarks',
   APPROVAL_REQUESTS: 'approvalRequests',
   RESCHEDULE_LOG: 'rescheduleLog',
   INVITES: 'invites',
+  NOTIFICATIONS: 'notifications',
 } as const;
 
 // Notification Types
@@ -77,6 +87,7 @@ export const NotificationType = {
   APPROVAL_GRANTED: 'approval_granted',
   APPROVAL_REJECTED: 'approval_rejected',
   TASK_ASSIGNED: 'task_assigned',
+  TASK_UPDATED: 'task_updated',
   TASK_COMPLETED: 'task_completed',
   TASK_CANCELLED: 'task_cancelled',
   TASK_OVERDUE: 'task_overdue',
