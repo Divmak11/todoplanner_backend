@@ -25,6 +25,7 @@ export {
   revokeUserAccess,
   restoreUserAccess,
   deleteUser,
+  deleteOwnAccount,
   updateProfile,
 } from './controllers/userController';
 
@@ -44,6 +45,7 @@ export {
   assignTask,
   updateTask,
   completeTask,
+  completeAssignment,
   cancelTask,
   reopenTask,
 } from './controllers/taskController';
@@ -64,7 +66,10 @@ export { addRemark } from './controllers/remarkController';
 // ============================================
 // CALENDAR FUNCTIONS
 // ============================================
-export { disconnectCalendar } from './services/calendarService';
+export {
+  disconnectCalendar,
+  exchangeCalendarAuthCode,
+} from './services/calendarService';
 
 // ============================================
 // INVITE MANAGEMENT FUNCTIONS
@@ -105,7 +110,16 @@ export {
   checkDeadlines,
   checkOverdueTasks,
   cleanupInactiveTracking,
+  keepCriticalFunctionsWarm,
 } from './triggers/scheduledFunctions';
+
+// ============================================
+// CALENDAR TRIGGERS
+// ============================================
+export {
+  onTaskWrite,
+  onAssignmentWrite,
+} from './triggers/calendarTriggers';
 
 // ============================================
 // REPORT EXPORT FUNCTIONS
