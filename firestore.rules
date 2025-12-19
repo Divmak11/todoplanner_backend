@@ -100,6 +100,15 @@ service cloud.firestore {
       
       // Only Super Admin can delete tasks
       allow delete: if isSuperAdmin();
+      
+      // Assignments subcollection for multi-assignee tasks
+      match /assignments/{assignmentId} {
+        // Approved users can read assignments
+        allow read: if isApproved();
+        
+        // Only Cloud Functions handle assignment writes
+        allow write: if false;
+      }
     }
     
     // ============================================
