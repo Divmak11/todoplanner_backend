@@ -66,8 +66,8 @@ export const notifyAdminNewUser = onDocumentCreated(
     if (newUser.status !== UserStatus.PENDING) return;
 
     await notifySuperAdmins(
-      '👤 Access Request',
-      'A new user is awaiting approval',
+      'Access Request',
+      'New user awaiting approval',
       createNotificationData(NotificationType.NEW_PENDING_USER, { userId })
     );
   }
@@ -90,8 +90,8 @@ export const notifyUserStatusChange = onDocumentUpdated(
     if (before.status === UserStatus.PENDING && after.status === UserStatus.ACTIVE) {
       await sendNotification(
         userId,
-        '✅ Welcome Aboard!',
-        'Your account is now active',
+        'Account Active',
+        'Your access is now approved',
         createNotificationData(NotificationType.APPROVAL_GRANTED)
       );
     }
@@ -100,8 +100,8 @@ export const notifyUserStatusChange = onDocumentUpdated(
     if (before.status !== UserStatus.REVOKED && after.status === UserStatus.REVOKED) {
       await sendNotification(
         userId,
-        '🚫 Access Suspended',
-        'Contact admin for details',
+        'Access Revoked',
+        'Contact admin for support',
         createNotificationData(NotificationType.APPROVAL_REJECTED)
       );
     }
@@ -125,8 +125,8 @@ export const notifyTeamCreation = onDocumentCreated(
 
     await sendMulticastNotification(
       memberIds,
-      '👥 Team Update',
-      `Added to ${team.name}`,
+      'Team Update',
+      `Added to team "${team.name}"`,
       createNotificationData(NotificationType.TEAM_CREATED, { teamId })
     );
   }
@@ -156,8 +156,8 @@ export const notifyTeamMemberChange = onDocumentUpdated(
     if (addedMembers.length > 0) {
       await sendMulticastNotification(
         addedMembers,
-        '👥 Team Update',
-        `Added to ${after.name}`,
+        'Team Update',
+        `Added to team "${after.name}"`,
         createNotificationData(NotificationType.MEMBER_ADDED, { teamId })
       );
     }
@@ -165,8 +165,8 @@ export const notifyTeamMemberChange = onDocumentUpdated(
     if (removedMembers.length > 0) {
       await sendMulticastNotification(
         removedMembers,
-        '👥 Team Update',
-        `Removed from ${before.name}`,
+        'Team Update',
+        `Removed from team "${before.name}"`,
         createNotificationData(NotificationType.MEMBER_REMOVED, { teamId })
       );
     }
@@ -192,7 +192,7 @@ export const notifyTaskAssignment = onDocumentCreated(
     const deadline = task.deadline?.toDate();
     const deadlineStr = deadline ? deadline.toLocaleDateString() : 'No deadline';
 
-    const title = '📋 New Task';
+    const title = 'Task Assigned';
     const body = `"${task.title}" • Due ${deadlineStr}`;
 
     // Handle multi-assignee tasks with conditional notifications
@@ -227,39 +227,36 @@ export const notifyTaskStatusChange = onDocumentUpdated(
 
     // Task completed - notify creator
     if (after.status === 'completed' && before.status === 'ongoing') {
-      // For multi-assignee or single-assignee, notify creator if they didn't complete it themselves
-      // (Note: For single assignee, assignedTo might be the one completing it. 
-      //  For multi-assignee, the last person completing their assignment triggers this.)
       await sendNotification(
         after.createdBy,
-        '✅ Task Done',
-        `"${after.title}" completed`,
+        'Task Completed',
+        `"${after.title}" marked done`,
         createNotificationData(NotificationType.TASK_COMPLETED, { taskId })
       );
     }
 
     // Task cancelled - notify assignee(s)
     if (after.status === 'cancelled' && before.status === 'ongoing') {
+      const cancelTitle = 'Task Cancelled';
+      const cancelBody = `"${after.title}" was cancelled`;
+
       if (after.isMultiAssignee && after.assigneeIds?.length > 0) {
-        // Multi-assignee: verify creator is not the one being notified (optional, but good practice)
-        // Usually creator cancels, so we notify assignees.
         const assigneeIds: string[] = after.assigneeIds;
         const notificationPromises = assigneeIds.map((userId) => {
-          if (userId === after.createdBy) return Promise.resolve(); // Don't notify self if creator is also assignee
+          if (userId === after.createdBy) return Promise.resolve();
           return sendNotification(
             userId,
-            '❌ Task Cancelled',
-            `"${after.title}" was cancelled`,
+            cancelTitle,
+            cancelBody,
             createNotificationData(NotificationType.TASK_CANCELLED, { taskId })
           );
         });
         await Promise.all(notificationPromises);
       } else if (after.assignedTo && after.createdBy !== after.assignedTo) {
-        // Single-assignee: notify assignee if not the creator
         await sendNotification(
           after.assignedTo,
-          '❌ Task Cancelled',
-          `"${after.title}" was cancelled`,
+          cancelTitle,
+          cancelBody,
           createNotificationData(NotificationType.TASK_CANCELLED, { taskId })
         );
       }
