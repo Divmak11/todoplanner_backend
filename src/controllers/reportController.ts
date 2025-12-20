@@ -326,37 +326,44 @@ async function generateTasksPDF(
                     );
                 }
 
-                // Bottom info row - use separate lines to avoid text overlap
-                let infoY = y + 55;
+                // Bottom info row - improved spacing to prevent overlap
+                let infoY = y + 60; // Start lower to give subtitle room
                 doc.fontSize(8).font('Helvetica').fillColor(gray);
 
-                // Row 1: Assignee and Deadline on same line with fixed widths
-                doc.font('Helvetica-Bold').text('Assignee: ', 52, infoY, { continued: true });
-                doc.font('Helvetica').text(assignee.length > 18 ? assignee.substring(0, 18) + '...' : assignee, { continued: false });
+                // Row 1: Assignee (Left) and Deadline (Right)
+                // Assignee
+                doc.font('Helvetica-Bold').text('Assignee:', 52, infoY);
+                doc.font('Helvetica').text(
+                    assignee.length > 25 ? assignee.substring(0, 25) + '...' : assignee,
+                    100, infoY, // Fixed X offset for value
+                    { width: 170, ellipsis: true }
+                );
 
-                // Deadline on the right side of row 1
+                // Deadline
                 if (deadline) {
                     const deadlineStr = deadline.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
-                    doc.font('Helvetica-Bold').fillColor(gray).text('Deadline: ', 280, infoY, { continued: true });
-                    doc.font('Helvetica').fillColor(isOverdue ? red : gray).text(deadlineStr, { continued: false });
+                    doc.font('Helvetica-Bold').fillColor(gray).text('Deadline:', 300, infoY);
+                    doc.font('Helvetica').fillColor(isOverdue ? red : gray).text(deadlineStr, 350, infoY);
                 }
 
-                infoY += 12; // Move to second row
+                infoY += 15; // Increased line height
 
-                // Row 2: Completed date and Created date
+                // Row 2: Completed (Left) or Created (Right)
+                // Completed
                 if (status === 'completed' && completedAt) {
                     const completedStr = completedAt.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
-                    doc.font('Helvetica-Bold').fillColor(gray).text('Completed: ', 52, infoY, { continued: true });
-                    doc.font('Helvetica').fillColor(green).text(completedStr, { continued: false });
+                    doc.font('Helvetica-Bold').fillColor(gray).text('Completed:', 52, infoY);
+                    doc.font('Helvetica').fillColor(green).text(completedStr, 100, infoY);
                 }
 
+                // Created
                 if (createdAt) {
                     const createdStr = createdAt.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
-                    doc.font('Helvetica-Bold').fillColor(gray).text('Created: ', 280, infoY, { continued: true });
-                    doc.font('Helvetica').fillColor(gray).text(createdStr, { continued: false });
+                    doc.font('Helvetica-Bold').fillColor(gray).text('Created:', 300, infoY);
+                    doc.font('Helvetica').fillColor(gray).text(createdStr, 350, infoY);
                 }
 
-                y += 110; // Card height + gap
+                y += 115; // Increased Total Card height + gap
             }
         }
 
