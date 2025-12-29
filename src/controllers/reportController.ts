@@ -9,6 +9,7 @@ interface ExportReportInput {
     endDate: string; // ISO date string
     teamId?: string;
     status?: string;
+    userId?: string; // Add member filter
 }
 
 // 2nd Gen configuration for report function - increased memory for PDF generation
@@ -35,6 +36,7 @@ export const exportReport = onCall(
         const endDate = data.endDate ? new Date(data.endDate) : null;
         const teamId = data.teamId || 'all';
         const status = data.status || 'all';
+        const userId = data.userId || 'all'; // Member filter
 
         try {
             // Build Firestore query
@@ -59,18 +61,40 @@ export const exportReport = onCall(
                 ...doc.data(),
             }));
 
-            // Filter by team (in-memory to avoid Firestore 'in' limit)
-            if (teamId !== 'all') {
+            // Filter by team (only if no specific member is selected)
+            // When a member is selected, team filter is ignored
+            if (teamId !== 'all' && userId === 'all') {
                 const teamDoc = await db.collection(Collections.TEAMS).doc(teamId).get();
                 if (teamDoc.exists) {
                     const memberIds = teamDoc.data()!.memberIds || [];
-                    tasks = tasks.filter((task: any) => memberIds.includes(task.assignedTo));
+                    tasks = tasks.filter((task: any) => {
+                        // Check legacy assignedTo
+                        if (memberIds.includes(task.assignedTo)) return true;
+                        // Check multi-assignee assigneeIds
+                        if (task.assigneeIds && Array.isArray(task.assigneeIds)) {
+                            return task.assigneeIds.some((id: string) => memberIds.includes(id));
+                        }
+                        return false;
+                    });
                 }
             }
 
             // Filter by status
             if (status !== 'all') {
                 tasks = tasks.filter((task: any) => task.status === status);
+            }
+
+            // Filter by member (individual user) - only show tasks where they are ASSIGNEE (not creator)
+            // This makes the member report show only tasks assigned to them
+            if (userId !== 'all') {
+                tasks = tasks.filter((task: any) => {
+                    // Include tasks where user is assignedTo (legacy)
+                    if (task.assignedTo === userId) return true;
+                    // Include tasks where user is in assigneeIds (multi-assignee)
+                    if (task.assigneeIds && Array.isArray(task.assigneeIds) && task.assigneeIds.includes(userId)) return true;
+                    // Note: NOT including tasks they created - those go to different view
+                    return false;
+                });
             }
 
             // Sort tasks by status: ongoing → completed → cancelled
@@ -108,12 +132,41 @@ export const exportReport = onCall(
                 }
             }
 
+            // Also fetch the member name if a specific member filter was applied
+            let memberName = '';
+            if (userId !== 'all') {
+                try {
+                    const memberDoc = await db.collection(Collections.USERS).doc(userId).get();
+                    if (memberDoc.exists) {
+                        memberName = memberDoc.data()!.name || 'Unknown Member';
+                    }
+                } catch (e) {
+                    memberName = 'Unknown Member';
+                }
+            }
+
+            // Fetch team name if team filter was applied
+            let teamName = '';
+            if (teamId !== 'all') {
+                try {
+                    const teamDoc = await db.collection(Collections.TEAMS).doc(teamId).get();
+                    if (teamDoc.exists) {
+                        teamName = teamDoc.data()!.name || 'Unknown Team';
+                    }
+                } catch (e) {
+                    teamName = 'Unknown Team';
+                }
+            }
+
             // Generate PDF
             const pdfBuffer = await generateTasksPDF(tasks, usersMap, {
                 startDate,
                 endDate,
                 teamId,
+                teamName,
                 status,
+                userId,
+                memberName,
             });
 
             // Return PDF as base64
@@ -206,8 +259,15 @@ async function generateTasksPDF(
         }
 
         if (filters.teamId && filters.teamId !== 'all') {
-            doc.font('Helvetica-Bold').text('Team Filter: ', 40, y, { continued: true });
-            doc.font('Helvetica').text('Specific Team');
+            doc.font('Helvetica-Bold').text('Team: ', 40, y, { continued: true });
+            doc.font('Helvetica').text(filters.teamName || 'Specific Team');
+            y += 18;
+        }
+
+        // Show member name if filtered by member
+        if (filters.userId && filters.userId !== 'all') {
+            doc.font('Helvetica-Bold').text('Member: ', 40, y, { continued: true });
+            doc.font('Helvetica').text(filters.memberName || 'Specific Member');
             y += 18;
         }
 
@@ -295,18 +355,24 @@ async function generateTasksPDF(
                     statusText = red;
                 }
 
-                // Card background - increased height to accommodate two info rows
-                const taskCardHeight = 100;
+                // Card background - proper height with spacing for all content
+                const taskCardHeight = 110;
                 doc.rect(40, y, contentWidth, taskCardHeight).fill('#ffffff');
                 doc.rect(40, y, contentWidth, taskCardHeight).stroke(borderGray);
 
                 // Left accent bar based on status
                 doc.rect(40, y, 4, taskCardHeight).fill(statusText);
 
-                // Task title
+                // Task Title - Stripping newlines and forcing single line
+                const cleanTitle = title.split('\n')[0].replace(/\s+/g, ' ').trim();
                 doc.fontSize(12).font('Helvetica-Bold').fillColor(darkGray).text(
-                    title.length > 60 ? title.substring(0, 60) + '...' : title,
-                    52, y + 12, { width: contentWidth - 130 }
+                    cleanTitle,
+                    52, y + 12, {
+                    width: contentWidth - 130,
+                    lineBreak: false,
+                    ellipsis: true,
+                    height: 14
+                }
                 );
 
                 // Status badge (top right)
@@ -318,52 +384,55 @@ async function generateTasksPDF(
                     { width: badgeWidth, align: 'center' }
                 );
 
-                // Subtitle/Description (truncated)
+                // Subtitle/Description - Aggressively cleaning and forcing single line
+                let subtitleY = y + 36;
                 if (subtitle) {
+                    // TAKE ONLY THE FIRST LINE, collapse whitespace, and truncate
+                    const firstLine = subtitle.split('\n')[0].trim();
+                    const cleanSubtitle = firstLine.replace(/\s+/g, ' ');
+
                     doc.fontSize(9).font('Helvetica').fillColor(gray).text(
-                        subtitle.length > 80 ? subtitle.substring(0, 80) + '...' : subtitle,
-                        52, y + 32, { width: contentWidth - 70 }
+                        cleanSubtitle,
+                        52, subtitleY, {
+                        width: contentWidth - 70,
+                        lineBreak: false,
+                        ellipsis: true,
+                        height: 11
+                    }
                     );
                 }
 
-                // Bottom info row - improved spacing to prevent overlap
-                let infoY = y + 60; // Start lower to give subtitle room
+                // Bottom info rows - ensure safe offset from subtitle
+                let infoY = y + 60;
                 doc.fontSize(8).font('Helvetica').fillColor(gray);
 
-                // Row 1: Assignee (Left) and Deadline (Right)
-                // Assignee
+                // Row 1: Assignee and Deadline
                 doc.font('Helvetica-Bold').text('Assignee:', 52, infoY);
-                doc.font('Helvetica').text(
-                    assignee.length > 25 ? assignee.substring(0, 25) + '...' : assignee,
-                    100, infoY, // Fixed X offset for value
-                    { width: 170, ellipsis: true }
-                );
+                const truncatedAssignee = assignee.length > 18 ? assignee.substring(0, 18) + '...' : assignee;
+                doc.font('Helvetica').text(truncatedAssignee, 105, infoY);
 
-                // Deadline
                 if (deadline) {
                     const deadlineStr = deadline.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
-                    doc.font('Helvetica-Bold').fillColor(gray).text('Deadline:', 300, infoY);
-                    doc.font('Helvetica').fillColor(isOverdue ? red : gray).text(deadlineStr, 350, infoY);
+                    doc.font('Helvetica-Bold').fillColor(gray).text('Deadline:', 260, infoY);
+                    doc.font('Helvetica').fillColor(isOverdue ? red : gray).text(deadlineStr, 310, infoY);
                 }
 
-                infoY += 15; // Increased line height
+                infoY += 18;
 
-                // Row 2: Completed (Left) or Created (Right)
-                // Completed
+                // Row 2: Completed and Created dates
                 if (status === 'completed' && completedAt) {
                     const completedStr = completedAt.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
                     doc.font('Helvetica-Bold').fillColor(gray).text('Completed:', 52, infoY);
-                    doc.font('Helvetica').fillColor(green).text(completedStr, 100, infoY);
+                    doc.font('Helvetica').fillColor(green).text(completedStr, 112, infoY);
                 }
 
-                // Created
                 if (createdAt) {
                     const createdStr = createdAt.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
-                    doc.font('Helvetica-Bold').fillColor(gray).text('Created:', 300, infoY);
-                    doc.font('Helvetica').fillColor(gray).text(createdStr, 350, infoY);
+                    doc.font('Helvetica-Bold').fillColor(gray).text('Created:', 260, infoY);
+                    doc.font('Helvetica').fillColor(gray).text(createdStr, 310, infoY);
                 }
 
-                y += 115; // Increased Total Card height + gap
+                y += 125; // Card height + gap
             }
         }
 

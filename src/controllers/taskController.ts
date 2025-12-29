@@ -7,6 +7,8 @@ import {
   AssignmentType,
   UserRole,
   NotificationType,
+  ApprovalRequestType,
+  ApprovalStatus,
 } from '../config/constants';
 import {
   validateAuthenticated,
@@ -29,6 +31,32 @@ import {
 
 // 2nd Gen configuration for callable functions
 const callableConfig = { region: 'asia-south1', concurrency: 80 };
+
+/**
+ * Helper: Auto-reject any pending reschedule requests for a task
+ * Called when task is completed or cancelled to prevent orphaned requests
+ */
+async function cleanupPendingRescheduleRequests(taskId: string, reason: string): Promise<void> {
+  const pendingRequests = await db
+    .collection(Collections.APPROVAL_REQUESTS)
+    .where('targetId', '==', taskId)
+    .where('type', '==', ApprovalRequestType.RESCHEDULE)
+    .where('status', '==', ApprovalStatus.PENDING)
+    .get();
+
+  if (pendingRequests.empty) return;
+
+  const batch = db.batch();
+  pendingRequests.docs.forEach((doc) => {
+    batch.update(doc.ref, {
+      status: ApprovalStatus.REJECTED,
+      resolvedAt: admin.firestore.FieldValue.serverTimestamp(),
+      resolvedBy: 'system',
+      resolutionNote: reason,
+    });
+  });
+  await batch.commit();
+}
 
 /**
  * Assign a new task to a member, multiple members, or team
@@ -231,6 +259,14 @@ export const updateTask = onCall(
       updateData.subtitle = updates.subtitle || '';
     }
 
+    if (updates.deadline !== undefined) {
+      const newDeadline = new Date(updates.deadline);
+      if (isNaN(newDeadline.getTime())) {
+        throw new HttpsError('invalid-argument', 'Invalid deadline format');
+      }
+      updateData.deadline = admin.firestore.Timestamp.fromDate(newDeadline);
+    }
+
     await db.collection(Collections.TASKS).doc(taskId).update(updateData);
 
     // Send update notifications to assignees (calendar can't notify about updates)
@@ -399,6 +435,9 @@ export const completeTask = onCall(
 
     await db.collection(Collections.TASKS).doc(taskId).update(taskUpdateData);
 
+    // Auto-reject any pending reschedule requests for this task
+    await cleanupPendingRescheduleRequests(taskId, 'Task completed');
+
     // Notification handled by Firestore trigger (notifyTaskStatusChange)
 
     return { success: true, message: 'Task marked as completed' };
@@ -495,6 +534,9 @@ export const cancelTask = onCall(
     // Handle calendar event deletion (handled by Firestore Trigger)
 
     await db.collection(Collections.TASKS).doc(taskId).update(taskUpdateData);
+
+    // Auto-reject any pending reschedule requests for this task
+    await cleanupPendingRescheduleRequests(taskId, 'Task cancelled');
 
     // Notification handled by Firestore trigger (notifyTaskStatusChange)
 

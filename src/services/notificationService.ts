@@ -67,6 +67,7 @@ export async function sendNotification(
         priority: 'high',
         notification: {
           channelId: 'todo_planner_channel',
+          sound: 'default',
         },
       },
       apns: {
@@ -136,6 +137,7 @@ export async function sendMulticastNotification(
         priority: 'high',
         notification: {
           channelId: 'todo_planner_channel',
+          sound: 'default',
         },
       },
       apns: {
