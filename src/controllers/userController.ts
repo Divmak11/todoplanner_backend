@@ -11,6 +11,7 @@ import {
   sendNotification,
   createNotificationData,
 } from '../services/notificationService';
+import { deleteAllUserCalendarEvents } from '../services/calendarService';
 import {
   ApproveUserInput,
   RejectUserInput,
@@ -406,12 +407,24 @@ export const deleteUser = onCall(
       batch.update(doc.ref, updates);
     });
 
-    // 3. Delete user document
+    // 3. Clean up calendar events if user had calendar connected
+    // IMPORTANT: Do this BEFORE deleting user doc so we can still fetch calendar data
+    const user = userDoc.data()!;
+    if (user.googleCalendarConnected) {
+      try {
+        console.log(`🗓️ Cleaning up calendar events for deleted user ${userId}`);
+        await deleteAllUserCalendarEvents(userId);
+        console.log(`✅ Calendar events cleaned up for ${userId}`);
+      } catch (error) {
+        console.error(`⚠️ Failed to clean up calendar events for ${userId}:`, error);
+        // Continue with deletion even if calendar cleanup fails
+      }
+    }
+
+    // 4. Delete user document
     batch.delete(db.collection(Collections.USERS).doc(userId));
 
-    // 4. Archive to deleted_users (Audit Log)
-    // We do this BEFORE deleting the main user doc loop essentially, but here we just add to batch
-    const user = userDoc.data()!;
+    // 5. Archive to deleted_users (Audit Log)
     batch.set(db.collection('deleted_users').doc(userId), {
       ...user,
       deletedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -420,7 +433,7 @@ export const deleteUser = onCall(
       originalUserId: userId,
     });
 
-    // 5. Clean up duplicates by email (The "Zombie" Killer)
+    // 6. Clean up duplicates by email (The "Zombie" Killer)
     if (user.email) {
       const duplicatesSnapshot = await db
         .collection(Collections.USERS)
@@ -574,10 +587,23 @@ export const deleteOwnAccount = onCall(
       batch.delete(doc.ref);
     });
 
-    // 5. Delete user document
+    // 5. Clean up calendar events if user had calendar connected
+    // IMPORTANT: Do this BEFORE deleting user doc so we can still fetch calendar data
+    if (user.googleCalendarConnected) {
+      try {
+        console.log(`🗓️ Cleaning up calendar events for self-deleting user ${userId}`);
+        await deleteAllUserCalendarEvents(userId);
+        console.log(`✅ Calendar events cleaned up for ${userId}`);
+      } catch (error) {
+        console.error(`⚠️ Failed to clean up calendar events for ${userId}:`, error);
+        // Continue with deletion even if calendar cleanup fails
+      }
+    }
+
+    // 6. Delete user document
     batch.delete(db.collection(Collections.USERS).doc(userId));
 
-    // 6. Archive to deleted_users (Audit Log)
+    // 7. Archive to deleted_users (Audit Log)
     batch.set(db.collection('deleted_users').doc(userId), {
       ...user,
       deletedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -586,7 +612,7 @@ export const deleteOwnAccount = onCall(
       originalUserId: userId,
     });
 
-    // 7. Clean up duplicates by email (The "Zombie" Killer)
+    // 8. Clean up duplicates by email (The "Zombie" Killer)
     if (user.email) {
       const duplicatesSnapshot = await db
         .collection(Collections.USERS)
@@ -603,7 +629,7 @@ export const deleteOwnAccount = onCall(
 
     await batch.commit();
 
-    // 8. Delete Firebase Auth account
+    // 9. Delete Firebase Auth account
     try {
       await auth.deleteUser(userId);
     } catch (error) {

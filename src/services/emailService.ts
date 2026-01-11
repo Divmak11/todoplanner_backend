@@ -1,7 +1,7 @@
-import * as functions from 'firebase-functions/v1';
+// Note: Using process.env for v2 functions (functions.config() is deprecated)
 
-// SendGrid will be configured via Firebase Functions config
-// Run: firebase functions:config:set sendgrid.key="YOUR_API_KEY" sendgrid.from="your-email@domain.com"
+// SendGrid configuration via environment variables
+// Set: SENDGRID_API_KEY, SENDGRID_FROM_EMAIL
 
 interface EmailConfig {
   apiKey: string;
@@ -11,15 +11,14 @@ interface EmailConfig {
 }
 
 /**
- * Get email configuration from Firebase Functions config
+ * Get email configuration from environment variables
  */
 function getEmailConfig(): EmailConfig {
-  const config = functions.config();
   return {
-    apiKey: config.sendgrid?.key || '',
-    fromEmail: config.sendgrid?.from || 'noreply@todoplannerapp.com',
-    appName: config.app?.name || 'TODO Planner',
-    appUrl: config.app?.url || 'https://todoplannerapp.com',
+    apiKey: process.env.SENDGRID_API_KEY || '',
+    fromEmail: process.env.SENDGRID_FROM_EMAIL || 'noreply@todoplannerapp.com',
+    appName: 'TODO Planner',
+    appUrl: 'https://todoplannerapp.com',
   };
 }
 

@@ -33,3 +33,4 @@ coverage/
 # Logs
 *.log
 npm-debug.log*
+.env

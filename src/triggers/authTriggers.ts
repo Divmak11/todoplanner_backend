@@ -17,8 +17,8 @@ import { sendInviteAcceptedEmail } from '../services/emailService';
  * Sets initial role and status based on configuration
  */
 export const createUserProfile = functions.region('asia-south1').auth.user().onCreate(async (user) => {
-  // Get super admin emails from environment config (comma-separated for multiple admins)
-  const superAdminEmailsStr = functions.config().app?.super_admin_email || '';
+  // Get super admin emails from environment variable (comma-separated for multiple admins)
+  const superAdminEmailsStr = process.env.SUPER_ADMIN_EMAILS || '';
   const superAdminEmails = superAdminEmailsStr
     .split(',')
     .map((email: string) => email.trim().toLowerCase())

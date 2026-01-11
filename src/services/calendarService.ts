@@ -1,4 +1,4 @@
-import * as functions from 'firebase-functions/v1';
+// Note: Using process.env for v2 functions (functions.config() is deprecated)
 import { onCall, HttpsError, CallableRequest } from 'firebase-functions/v2/https';
 import { google, Auth } from 'googleapis';
 import { db } from '../config/firebase-admin';
@@ -30,13 +30,15 @@ function calendarError(
   console.error(`${LOG_PREFIX} [${ts}] [${operation}] ERROR user=${userId}`, { ...details, error });
 }
 
-/**
- * Result type for getAuthenticatedClient
- */
 interface AuthClientResult {
   oauth2Client: Auth.OAuth2Client;
   calendar: ReturnType<typeof google.calendar>;
 }
+
+/**
+ * Type for the Calendar API instance to avoid repetitive ReturnType usage
+ */
+type CalendarApi = ReturnType<typeof google.calendar>;
 
 /**
  * Create an authenticated OAuth2 client with automatic token refresh.
@@ -64,8 +66,8 @@ async function getAuthenticatedClient(userId: string): Promise<AuthClientResult 
     return null;
   }
 
-  const clientId = functions.config().google?.client_id;
-  const clientSecret = functions.config().google?.client_secret;
+  const clientId = process.env.GOOGLE_CLIENT_ID;
+  const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
 
   if (!clientId || !clientSecret) {
     calendarError('GET_AUTH_CLIENT', userId, 'Missing OAuth config', {
@@ -218,7 +220,8 @@ export async function createCalendarEventForUser(
   title: string,
   subtitle: string,
   deadline: Date,
-  skipTaskDocUpdate = false
+  skipTaskDocUpdate = false,
+  providedCalendar?: CalendarApi
 ): Promise<string | null> {
   // Check if user has calendar connected
   const userDoc = await db.collection(Collections.USERS).doc(userId).get();
@@ -240,9 +243,9 @@ export async function createCalendarEventForUser(
     deadline: deadline.toISOString(),
   });
 
-  // Get authenticated client with token refresh support
-  const authResult = await getAuthenticatedClient(userId);
-  if (!authResult) {
+  // Get authenticated client with token refresh support (if not provided)
+  const calendar = providedCalendar || (await getAuthenticatedClient(userId))?.calendar;
+  if (!calendar) {
     calendarLog('CREATE_EVENT', userId, {
       status: 'FAILED',
       reason: 'no_auth_client',
@@ -250,8 +253,6 @@ export async function createCalendarEventForUser(
     });
     return null;
   }
-
-  const { calendar } = authResult;
 
   try {
     // Create event with deadline as start time, +1 hour as end time
@@ -318,7 +319,8 @@ export async function updateCalendarEvent(
   eventId: string,
   newDeadline?: Date,
   newTitle?: string,
-  newSubtitle?: string
+  newSubtitle?: string,
+  providedCalendar?: CalendarApi
 ): Promise<boolean> {
   calendarLog('UPDATE_EVENT', userId, {
     status: 'STARTING',
@@ -327,9 +329,9 @@ export async function updateCalendarEvent(
     newTitle,
   });
 
-  // Get authenticated client with token refresh support
-  const authResult = await getAuthenticatedClient(userId);
-  if (!authResult) {
+  // Get authenticated client with token refresh support (if not provided)
+  const calendar = providedCalendar || (await getAuthenticatedClient(userId))?.calendar;
+  if (!calendar) {
     calendarLog('UPDATE_EVENT', userId, {
       status: 'FAILED',
       reason: 'no_auth_client',
@@ -337,8 +339,6 @@ export async function updateCalendarEvent(
     });
     return false;
   }
-
-  const { calendar } = authResult;
 
   try {
     const requestBody: any = {};
@@ -379,13 +379,14 @@ export async function updateCalendarEvent(
  */
 export async function deleteCalendarEvent(
   userId: string,
-  eventId: string
+  eventId: string,
+  providedCalendar?: CalendarApi
 ): Promise<boolean> {
   calendarLog('DELETE_EVENT', userId, { status: 'STARTING', eventId });
 
-  // Get authenticated client with token refresh support
-  const authResult = await getAuthenticatedClient(userId);
-  if (!authResult) {
+  // Get authenticated client with token refresh support (if not provided)
+  const calendar = providedCalendar || (await getAuthenticatedClient(userId))?.calendar;
+  if (!calendar) {
     calendarLog('DELETE_EVENT', userId, {
       status: 'FAILED',
       reason: 'no_auth_client',
@@ -393,8 +394,6 @@ export async function deleteCalendarEvent(
     });
     return false;
   }
-
-  const { calendar } = authResult;
 
   try {
     await calendar.events.delete({
@@ -422,70 +421,64 @@ export async function deleteCalendarEvent(
   }
 }
 
-/**
- * Delete all calendar events for a user's tasks
- * Handles both single-assignee (legacy) and multi-assignee tasks
- */
+// eslint-disable-next-line jsdoc/require-jsdoc
 export async function deleteAllUserCalendarEvents(userId: string): Promise<void> {
   calendarLog('DELETE_ALL_EVENTS', userId, { status: 'STARTING' });
 
-  const userDoc = await db.collection(Collections.USERS).doc(userId).get();
-  const user = userDoc.data();
-
-  if (!user || !user.googleCalendarConnected) {
+  // Get authenticated client ONCE for all deletions
+  const authResult = await getAuthenticatedClient(userId);
+  if (!authResult) {
     calendarLog('DELETE_ALL_EVENTS', userId, {
-      status: 'SKIPPED',
-      reason: 'calendar_not_connected',
+      status: 'FAILED',
+      reason: 'no_auth_client',
     });
     return;
   }
+  const { calendar } = authResult;
 
   let deletedCount = 0;
-  let legacyTasksWithEvents = 0;
-  let multiAssigneeTasksWithEvents = 0;
 
-  // 1. Handle legacy single-assignee tasks (assignedTo field)
+  // 1. Handle legacy single-assignee tasks
+  // OPTIMIZATION: Only fetch those that have a calendarEventId
   const legacyTasksSnapshot = await db.collection(Collections.TASKS)
     .where('assignedTo', '==', userId)
+    .where('calendarEventId', '>=', '') // Efficient check for non-empty string
     .get();
 
-  for (const taskDoc of legacyTasksSnapshot.docs) {
+  const legacyDeletes = legacyTasksSnapshot.docs.map(async (taskDoc) => {
     const task = taskDoc.data();
     if (task.calendarEventId) {
-      legacyTasksWithEvents++;
-      const deleted = await deleteCalendarEvent(userId, task.calendarEventId);
+      const deleted = await deleteCalendarEvent(userId, task.calendarEventId, calendar);
       if (deleted) {
         deletedCount++;
-        // Clear the calendarEventId from Firestore after successful deletion
         await taskDoc.ref.update({ calendarEventId: null });
       }
     }
-  }
+  });
 
-  // 2. Handle multi-assignee tasks (assignments subcollection)
+  // 2. Handle multi-assignee tasks
   const assignmentsSnapshot = await db.collectionGroup(Collections.ASSIGNMENTS)
     .where('userId', '==', userId)
+    .where('calendarEventId', '>=', '')
     .get();
 
-  for (const assignmentDoc of assignmentsSnapshot.docs) {
+  const assignmentDeletes = assignmentsSnapshot.docs.map(async (assignmentDoc) => {
     const assignment = assignmentDoc.data();
     if (assignment.calendarEventId) {
-      multiAssigneeTasksWithEvents++;
-      const deleted = await deleteCalendarEvent(userId, assignment.calendarEventId);
+      const deleted = await deleteCalendarEvent(userId, assignment.calendarEventId, calendar);
       if (deleted) {
         deletedCount++;
-        // Clear the calendarEventId from the assignment document
         await assignmentDoc.ref.update({ calendarEventId: null });
       }
     }
-  }
+  });
+
+  // Execute all deletions in parallel (with controlled concurrency if needed, but here simple Promise.all)
+  // We use Promise.allSettled to ensure failure of one doesn't stop others
+  await Promise.allSettled([...legacyDeletes, ...assignmentDeletes]);
 
   calendarLog('DELETE_ALL_EVENTS', userId, {
     status: 'COMPLETE',
-    legacyTasks: legacyTasksSnapshot.docs.length,
-    legacyTasksWithEvents,
-    multiAssigneeTasks: assignmentsSnapshot.docs.length,
-    multiAssigneeTasksWithEvents,
     totalDeleted: deletedCount,
   });
 }
@@ -493,7 +486,6 @@ export async function deleteAllUserCalendarEvents(userId: string): Promise<void>
 /**
  * Disconnect Google Calendar - Callable Cloud Function
  * Deletes all calendar events but preserves tokens for seamless reconnection.
- * Tokens are only deleted on account deletion (in userController.deleteUser).
  */
 export const disconnectCalendar = onCall(
   callableConfig,
@@ -502,6 +494,7 @@ export const disconnectCalendar = onCall(
     const userId = validateAuthenticated(context);
     calendarLog('DISCONNECT', userId, { status: 'STARTING' });
 
+    // Check current connection status first
     const userDoc = await db.collection(Collections.USERS).doc(userId).get();
     const user = userDoc.data();
 
@@ -510,15 +503,19 @@ export const disconnectCalendar = onCall(
       throw new HttpsError('not-found', 'User not found');
     }
 
+    // If already disconnected, return early (idempotent)
     if (!user.googleCalendarConnected) {
-      calendarLog('DISCONNECT', userId, { status: 'SKIPPED', reason: 'not_connected' });
-      return { success: true, message: 'Calendar not connected' };
+      calendarLog('DISCONNECT', userId, { status: 'ALREADY_DISCONNECTED' });
+      return { success: true, message: 'Calendar already disconnected' };
     }
 
-    // Delete all calendar events for user's tasks
+    // IMPORTANT: Delete events BEFORE setting flag to false
+    // This is because getAuthenticatedClient() checks the flag and returns null if false
+    // If we set flag first, cleanup would fail!
     await deleteAllUserCalendarEvents(userId);
 
-    // Only set flag to false, preserve tokens for seamless reconnection
+    // Only set flag to false AFTER cleanup completes
+    // Preserve tokens for seamless reconnection
     await db.collection(Collections.USERS).doc(userId).update({
       googleCalendarConnected: false,
     });
@@ -536,123 +533,122 @@ export const disconnectCalendar = onCall(
 async function syncExistingTasksToCalendar(userId: string): Promise<number> {
   calendarLog('SYNC_EXISTING_TASKS', userId, { status: 'STARTING' });
 
-  let syncedCount = 0;
-  let skippedPastDeadline = 0;
-  let legacyTasksWithEvents = 0;
-  let multiAssigneeTasksWithEvents = 0;
+  // Get authenticated client ONCE for all syncs
+  const authResult = await getAuthenticatedClient(userId);
+  if (!authResult) {
+    calendarLog('SYNC_EXISTING_TASKS', userId, { status: 'FAILED', reason: 'no_auth_client' });
+    return 0;
+  }
+  const { calendar } = authResult;
 
-  // 1. Handle legacy single-assignee tasks (assignedTo field)
+  let syncedCount = 0;
+
+  // 1. Handle legacy single-assignee tasks
   const legacyTasksSnapshot = await db.collection(Collections.TASKS)
     .where('assignedTo', '==', userId)
     .where('status', '==', TaskStatus.ONGOING)
     .get();
 
-  for (const taskDoc of legacyTasksSnapshot.docs) {
+  const legacySyncs = legacyTasksSnapshot.docs.map(async (taskDoc) => {
     const task = taskDoc.data();
+    if (task.calendarEventId) return;
 
-    // Skip if already has a calendar event
-    if (task.calendarEventId) {
-      legacyTasksWithEvents++;
-      continue;
-    }
-
-    // Create calendar event for this task
     const deadline = task.deadline?.toDate();
     if (deadline && deadline > new Date()) {
-      calendarLog('SYNC_LEGACY_TASK', userId, {
-        taskId: taskDoc.id,
-        title: task.title,
-        deadline: deadline.toISOString(),
-      });
-
       const eventId = await createCalendarEventForUser(
         userId,
         taskDoc.id,
         task.title,
         task.subtitle || '',
-        deadline
+        deadline,
+        false, // updateTaskDoc
+        calendar
       );
-
-      if (eventId) {
-        syncedCount++;
-      }
-    } else {
-      skippedPastDeadline++;
+      if (eventId) syncedCount++;
     }
-  }
+  });
 
-  // 2. Handle multi-assignee tasks (assignments subcollection)
-  // Get all ongoing assignments for this user
+  // 2. Handle multi-assignee tasks
   const assignmentsSnapshot = await db.collectionGroup(Collections.ASSIGNMENTS)
     .where('userId', '==', userId)
     .where('status', '==', TaskAssignmentStatus.ONGOING)
     .get();
 
-  for (const assignmentDoc of assignmentsSnapshot.docs) {
+  const assignmentSyncs = assignmentsSnapshot.docs.map(async (assignmentDoc) => {
     const assignment = assignmentDoc.data();
+    if (assignment.calendarEventId) return;
 
-    // Skip if already has a calendar event
-    if (assignment.calendarEventId) {
-      multiAssigneeTasksWithEvents++;
-      continue;
-    }
-
-    // Get the parent task to fetch deadline and title
     const taskId = assignmentDoc.ref.parent.parent?.id;
-    if (!taskId) {
-      calendarLog('SYNC_ASSIGNMENT_SKIP', userId, {
-        reason: 'no_task_id',
-        assignmentPath: assignmentDoc.ref.path,
-      });
-      continue;
-    }
+    if (!taskId) return;
 
     const taskDoc = await db.collection(Collections.TASKS).doc(taskId).get();
     const task = taskDoc.data();
 
-    if (!task || task.status !== TaskStatus.ONGOING) {
-      continue;
-    }
+    if (!task || task.status !== TaskStatus.ONGOING) return;
 
-    // Create calendar event for this assignment
     const deadline = task.deadline?.toDate();
     if (deadline && deadline > new Date()) {
-      calendarLog('SYNC_MULTI_ASSIGNEE_TASK', userId, {
-        taskId,
-        title: task.title,
-        deadline: deadline.toISOString(),
-      });
-
       const eventId = await createCalendarEventForUser(
         userId,
         taskId,
         task.title,
         task.subtitle || '',
         deadline,
-        true // Skip task doc update for multi-assignee
+        true, // skipTaskDocUpdate (assignment handles it)
+        calendar
       );
-
       if (eventId) {
-        // Store the calendarEventId in the assignment document (not the task)
         await assignmentDoc.ref.update({ calendarEventId: eventId });
         syncedCount++;
       }
-    } else {
-      skippedPastDeadline++;
     }
-  }
+  });
+
+  // Execute all syncs in parallel
+  await Promise.allSettled([...legacySyncs, ...assignmentSyncs]);
 
   calendarLog('SYNC_EXISTING_TASKS', userId, {
     status: 'COMPLETE',
-    legacyTasks: legacyTasksSnapshot.docs.length,
-    legacyTasksWithEvents,
-    multiAssigneeTasks: assignmentsSnapshot.docs.length,
-    multiAssigneeTasksWithEvents,
     syncedCount,
-    skippedPastDeadline,
   });
 
   return syncedCount;
+}
+
+/**
+ * Verify that the calendar access token is valid by making a test API call.
+ * This prevents false positive "connected" status when tokens don't actually work.
+ * 
+ * @param accessToken - The access token to verify
+ * @returns Object with success status and error details if failed
+ */
+async function verifyCalendarAccess(accessToken: string): Promise<{ success: boolean; error?: string }> {
+  const clientId = process.env.GOOGLE_CLIENT_ID;
+  const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+
+  if (!clientId || !clientSecret) {
+    return { success: false, error: 'OAuth credentials not configured' };
+  }
+
+  try {
+    const oauth2Client = new google.auth.OAuth2(clientId, clientSecret, '');
+    oauth2Client.setCredentials({ access_token: accessToken });
+
+    const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
+
+    // Make a lightweight test call using events.list (works with calendar.events scope)
+    // Note: calendar.settings.list requires broader scope that app doesn't have
+    await calendar.events.list({
+      calendarId: 'primary',
+      maxResults: 1,
+      timeMin: new Date().toISOString(),
+    });
+
+    return { success: true };
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return { success: false, error: errorMessage };
+  }
 }
 
 /**
@@ -662,9 +658,14 @@ async function syncExistingTasksToCalendar(userId: string): Promise<number> {
  * access_token and refresh_token. The refresh_token is stored in Firestore
  * so the backend can refresh tokens automatically without user interaction.
  *
+ * IMPORTANT: This function now VERIFIES the tokens work before setting
+ * googleCalendarConnected = true, preventing false positive connections.
+ *
  * This is the key to making calendar integration work reliably:
  * - Mobile app gets serverAuthCode via GoogleSignIn (no refresh token exposed)
  * - Backend exchanges it for REAL refresh_token from Google
+ * - Backend VERIFIES the token works by making a test API call
+ * - Only then marks calendar as connected
  * - Backend can now refresh access tokens anytime (even when app is closed)
  */
 export const exchangeCalendarAuthCode = onCall(
@@ -687,8 +688,8 @@ export const exchangeCalendarAuthCode = onCall(
       throw new HttpsError('invalid-argument', 'authCode is required');
     }
 
-    const clientId = functions.config().google?.client_id;
-    const clientSecret = functions.config().google?.client_secret;
+    const clientId = process.env.GOOGLE_CLIENT_ID;
+    const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
 
     if (!clientId || !clientSecret) {
       calendarError('EXCHANGE_AUTH_CODE', userId, 'Missing OAuth config', {
@@ -730,9 +731,29 @@ export const exchangeCalendarAuthCode = onCall(
         );
       }
 
-      // Store tokens in Firestore
+      // CRITICAL: Verify the token actually works before marking as connected
+      // This prevents false positive "connected" status
+      calendarLog('EXCHANGE_AUTH_CODE', userId, { status: 'VERIFYING_TOKEN' });
+      const verificationResult = await verifyCalendarAccess(tokens.access_token);
+
+      if (!verificationResult.success) {
+        calendarLog('EXCHANGE_AUTH_CODE', userId, {
+          status: 'VERIFICATION_FAILED',
+          reason: verificationResult.error,
+        });
+        throw new HttpsError(
+          'internal',
+          `Calendar verification failed: ${verificationResult.error}. Please try connecting again.`
+        );
+      }
+
+      calendarLog('EXCHANGE_AUTH_CODE', userId, {
+        status: 'VERIFICATION_SUCCESS',
+        note: 'Token verified - calendar API is accessible',
+      });
+
+      // Prepare token data for Firestore
       const updateData: Record<string, unknown> = {
-        googleCalendarConnected: true,
         googleAccessToken: tokens.access_token,
       };
 
@@ -751,11 +772,16 @@ export const exchangeCalendarAuthCode = onCall(
         });
       }
 
+      // CRITICAL: Only set googleCalendarConnected = true AFTER verification passes
+      // This is the key fix to prevent false positive connections
+      updateData.googleCalendarConnected = true;
+
       await db.collection(Collections.USERS).doc(userId).update(updateData);
       calendarLog('EXCHANGE_AUTH_CODE', userId, {
         status: 'TOKENS_SAVED_TO_FIRESTORE',
         savedAccessToken: true,
         savedRefreshToken: !!tokens.refresh_token,
+        connectedFlagSet: true,
       });
 
       // Sync existing ongoing tasks to calendar (don't await - run in background)

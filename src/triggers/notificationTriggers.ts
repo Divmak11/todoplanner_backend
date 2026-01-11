@@ -1,5 +1,5 @@
 import { onDocumentCreated, onDocumentUpdated } from 'firebase-functions/v2/firestore';
-import { admin, db } from '../config/firebase-admin';
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 import { Collections, UserStatus, NotificationType } from '../config/constants';
 import {
   sendNotification,
@@ -12,9 +12,9 @@ import {
 const triggerConfig = { region: 'asia-south1' };
 
 /**
- * Helper: Send task assignment notification conditionally based on calendar connection
- * - Always logs to Activity (Firestore notifications collection)
- * - Only sends FCM push if user has no calendar connected (calendar event shows the task)
+ * Helper: Send task assignment notification
+ * ALWAYS sends FCM push notification regardless of calendar status.
+ * Calendar events are supplementary, not a replacement for push notifications.
  */
 async function sendConditionalAssignmentNotification(
   userId: string,
@@ -22,32 +22,15 @@ async function sendConditionalAssignmentNotification(
   body: string,
   taskId: string
 ): Promise<void> {
-  // Check if user has calendar connected
-  const userDoc = await db.collection(Collections.USERS).doc(userId).get();
-  const user = userDoc.data();
-  const hasCalendar = user?.googleCalendarConnected === true;
-
-  if (hasCalendar) {
-    // User has calendar - only log to Activity, skip FCM (calendar event shows the task)
-    await db.collection('notifications').add({
-      userId,
-      type: NotificationType.TASK_ASSIGNED,
-      title,
-      message: body,
-      taskId,
-      isRead: false,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
-    console.log(`Activity log saved for calendar user ${userId} (FCM skipped - calendar shows event)`);
-  } else {
-    // No calendar - send full notification (Activity + FCM)
-    await sendNotification(
-      userId,
-      title,
-      body,
-      createNotificationData(NotificationType.TASK_ASSIGNED, { taskId })
-    );
-  }
+  // Always send full notification (Activity + FCM)
+  // Even if user has calendar connected, they should get push notification
+  // Calendar events are async and user might not be checking calendar
+  await sendNotification(
+    userId,
+    title,
+    body,
+    createNotificationData(NotificationType.TASK_ASSIGNED, { taskId })
+  );
 }
 
 /**
