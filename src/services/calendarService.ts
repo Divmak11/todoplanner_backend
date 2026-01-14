@@ -172,12 +172,15 @@ async function handleCalendarAuthError(error: unknown, userId: string): Promise<
       action: 'RESETTING_CONNECTION',
     });
 
-    // Only set flag to false, keep tokens for potential re-auth
+    // Clean up connection AND tokens immediately
+    // This ensures reconnectCalendar doesn't try to use dead tokens
     await db.collection(Collections.USERS).doc(userId).update({
       googleCalendarConnected: false,
+      googleRefreshToken: admin.firestore.FieldValue.delete(),
+      googleAccessToken: admin.firestore.FieldValue.delete(),
     });
 
-    calendarLog('CONNECTION_RESET', userId, { notifyingUser: true, tokensPreserved: true });
+    calendarLog('CONNECTION_RESET', userId, { notifyingUser: true, tokensCleared: true });
 
     // Notify user to reconnect
     await sendNotification(

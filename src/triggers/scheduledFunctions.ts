@@ -273,3 +273,82 @@ export const keepCriticalFunctionsWarm = onSchedule(
     console.log('🔥 Warm-up ping executed at', new Date().toISOString());
   }
 );
+
+/**
+ * Scheduled function: Maintain Google Calendar tokens
+ * Runs on the 1st of every month at 3 AM to proactively refresh tokens
+ * and detect revoked access before users experience failures.
+ */
+export const maintainCalendarTokens = onSchedule(
+  { schedule: '0 3 1 * *', ...scheduleConfig }, // 3 AM on 1st of month
+  async () => {
+    console.log('🔄 [CALENDAR_MAINTENANCE] Starting monthly token check...');
+
+    const usersWithCalendar = await db.collection(Collections.USERS)
+      .where('googleCalendarConnected', '==', true)
+      .get();
+
+    let refreshedCount = 0;
+    let revokedCount = 0;
+    let errorCount = 0;
+
+    const clientId = process.env.GOOGLE_CLIENT_ID;
+    const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+
+    if (!clientId || !clientSecret) {
+      console.error('🔄 [CALENDAR_MAINTENANCE] Missing OAuth credentials, aborting');
+      return;
+    }
+
+    // Import google auth dynamically to avoid circular dependencies
+    const { google } = await import('googleapis');
+
+    for (const userDoc of usersWithCalendar.docs) {
+      const userId = userDoc.id;
+      const user = userDoc.data();
+
+      if (!user.googleRefreshToken) {
+        console.log(`🔄 [CALENDAR_MAINTENANCE] Skipping ${userId} - no refresh token`);
+        continue;
+      }
+
+      try {
+        // Attempt to refresh the token
+        const oauth2Client = new google.auth.OAuth2(clientId, clientSecret, '');
+        oauth2Client.setCredentials({ refresh_token: user.googleRefreshToken });
+        const { credentials } = await oauth2Client.refreshAccessToken();
+
+        if (credentials.access_token) {
+          await userDoc.ref.update({ googleAccessToken: credentials.access_token });
+          refreshedCount++;
+          console.log(`✅ [CALENDAR_MAINTENANCE] Refreshed token for ${userId}`);
+        }
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : '';
+        if (msg.includes('invalid_grant') || msg.includes('revoked')) {
+          // Token was revoked externally
+          await userDoc.ref.update({
+            googleCalendarConnected: false,
+            googleRefreshToken: admin.firestore.FieldValue.delete(),
+            googleAccessToken: admin.firestore.FieldValue.delete(),
+          });
+          revokedCount++;
+          console.log(`⚠️ [CALENDAR_MAINTENANCE] Token revoked for ${userId}`);
+
+          // Notify user about revocation
+          await sendNotification(
+            userId,
+            '🔄 Calendar Reconnection Required',
+            'Your calendar connection expired. Please reconnect in Settings.',
+            createNotificationData(NotificationType.TASK_UPDATED, { action: 'calendar_reconnect' })
+          );
+        } else {
+          errorCount++;
+          console.error(`❌ [CALENDAR_MAINTENANCE] Error for ${userId}:`, msg);
+        }
+      }
+    }
+
+    console.log(`🔄 [CALENDAR_MAINTENANCE] Complete. Refreshed: ${refreshedCount}, Revoked: ${revokedCount}, Errors: ${errorCount}`);
+  }
+);

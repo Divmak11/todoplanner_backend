@@ -112,6 +112,7 @@ export {
   checkOverdueTasks,
   cleanupInactiveTracking,
   keepCriticalFunctionsWarm,
+  maintainCalendarTokens,
 } from './triggers/scheduledFunctions';
 
 // ============================================
