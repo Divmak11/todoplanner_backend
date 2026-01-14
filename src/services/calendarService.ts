@@ -1,7 +1,7 @@
 // Note: Using process.env for v2 functions (functions.config() is deprecated)
 import { onCall, HttpsError, CallableRequest } from 'firebase-functions/v2/https';
 import { google, Auth } from 'googleapis';
-import { db } from '../config/firebase-admin';
+import { db, admin } from '../config/firebase-admin';
 import { Collections, NotificationType, TaskStatus, TaskAssignmentStatus } from '../config/constants';
 import { sendNotification, createNotificationData } from './notificationService';
 import { validateAuthenticated } from '../utils/validators';
@@ -820,6 +820,135 @@ export const exchangeCalendarAuthCode = onCall(
         'internal',
         `Failed to exchange auth code: ${errorMessage}`
       );
+    }
+  }
+);
+
+/**
+ * Reconnect Google Calendar using existing refresh token.
+ * 
+ * This avoids the need for the user to go through the OAuth flow again
+ * if we already have valid tokens stored.
+ */
+export const reconnectCalendar = onCall(
+  callableConfig,
+  async (request: CallableRequest<unknown>) => {
+    const context = { auth: request.auth };
+    const userId = validateAuthenticated(context);
+
+    calendarLog('RECONNECT_CALENDAR', userId, {
+      status: 'STARTING',
+    });
+
+    try {
+      // 1. Check for existing tokens
+      const userDoc = await db.collection(Collections.USERS).doc(userId).get();
+      const user = userDoc.data();
+
+      if (!user?.googleRefreshToken) {
+        calendarLog('RECONNECT_CALENDAR', userId, {
+          status: 'FAILED',
+          reason: 'no_refresh_token',
+        });
+        return {
+          success: false,
+          message: 'No saved credentials found. Please connect as a new user.',
+          requiresReauth: true,
+        };
+      }
+
+      // 2. Refresh the access token using the stored refresh token
+      // We do this by creating a client with the refresh token and forcing a refresh
+      const clientId = process.env.GOOGLE_CLIENT_ID;
+      const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+
+      if (!clientId || !clientSecret) {
+        throw new HttpsError('failed-precondition', 'Server OAuth credentials not configured');
+      }
+
+      const oauth2Client = new google.auth.OAuth2(clientId, clientSecret, '');
+      oauth2Client.setCredentials({
+        refresh_token: user.googleRefreshToken,
+      });
+
+      // Force a refresh explicitly
+      const { credentials } = await oauth2Client.refreshAccessToken();
+      const newAccessToken = credentials.access_token;
+
+      if (!newAccessToken) {
+        throw new Error('Failed to refresh access token');
+      }
+
+      // 3. Verify the new token actually works
+      const verificationResult = await verifyCalendarAccess(newAccessToken);
+      if (!verificationResult.success) {
+        // If verification fails with a valid refresh token, it usually means 
+        // the user revoked access in their Google Account settings.
+        calendarLog('RECONNECT_CALENDAR', userId, {
+          status: 'VERIFICATION_FAILED',
+          reason: verificationResult.error,
+        });
+
+        // Clear invalid tokens so UI knows to force re-auth next time
+        await db.collection(Collections.USERS).doc(userId).update({
+          googleRefreshToken: admin.firestore.FieldValue.delete(),
+          googleAccessToken: admin.firestore.FieldValue.delete(),
+          googleCalendarConnected: false,
+        });
+
+        return {
+          success: false,
+          message: 'Connection revoked. Please reconnect your account.',
+          requiresReauth: true,
+        };
+      }
+
+      // 4. Success - Update Firestore
+      await db.collection(Collections.USERS).doc(userId).update({
+        googleAccessToken: newAccessToken,
+        googleCalendarConnected: true,
+      });
+
+      // 5. Trigger sync
+      calendarLog('RECONNECT_CALENDAR', userId, {
+        status: 'STARTING_BACKGROUND_SYNC',
+      });
+      syncExistingTasksToCalendar(userId).catch((err) => {
+        calendarError('SYNC_EXISTING_TASKS', userId, err, { source: 'background_reconnect' });
+      });
+
+      calendarLog('RECONNECT_CALENDAR', userId, { status: 'SUCCESS' });
+
+      return {
+        success: true,
+        message: 'Calendar reconnected successfully',
+        requiresReauth: false,
+      };
+
+    } catch (error) {
+      calendarError('RECONNECT_CALENDAR', userId, error, {});
+
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+
+      // If it's a token revocation (invalid_grant) during refresh
+      if (errorMessage.includes('invalid_grant') ||
+        errorMessage.includes('revoked')) {
+
+        // Clean up invalid tokens
+        await db.collection(Collections.USERS).doc(userId).update({
+          googleRefreshToken: admin.firestore.FieldValue.delete(),
+          googleAccessToken: admin.firestore.FieldValue.delete(),
+          googleCalendarConnected: false,
+        });
+
+        return {
+          success: false,
+          message: 'Connection expired. Please connect again.',
+          requiresReauth: true,
+        };
+      }
+
+      throw new HttpsError('internal', `Reconnection failed: ${errorMessage}`);
     }
   }
 );

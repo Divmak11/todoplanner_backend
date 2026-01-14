@@ -69,6 +69,7 @@ export { addRemark } from './controllers/remarkController';
 export {
   disconnectCalendar,
   exchangeCalendarAuthCode,
+  reconnectCalendar,
 } from './services/calendarService';
 
 // ============================================
