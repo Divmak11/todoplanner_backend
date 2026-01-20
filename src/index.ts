@@ -111,7 +111,6 @@ export {
   checkDeadlines,
   checkOverdueTasks,
   cleanupInactiveTracking,
-  keepCriticalFunctionsWarm,
   maintainCalendarTokens,
 } from './triggers/scheduledFunctions';
 

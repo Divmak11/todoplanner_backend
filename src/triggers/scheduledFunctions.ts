@@ -12,17 +12,18 @@ const scheduleConfig = { region: 'asia-south1', timeZone: 'Asia/Kolkata' };
 
 /**
  * Scheduled function: Check for upcoming deadlines and send reminders
- * Runs every hour
+ * Runs every 4 hours (optimized from hourly to reduce costs)
+ * Window widened to 20-24 hours to ensure no tasks are missed
  */
 export const checkDeadlines = onSchedule(
-  { schedule: 'every 1 hours', ...scheduleConfig },
+  { schedule: 'every 4 hours', ...scheduleConfig },
   async () => {
     const now = admin.firestore.Timestamp.now();
     const nowMs = now.toMillis();
 
     // Define time window for 24-hour reminder
     const oneDayMs = 24 * 60 * 60 * 1000;
-    const oneHourMs = 60 * 60 * 1000; // Used for time window calculation
+    const fourHoursMs = 4 * 60 * 60 * 1000; // Check window matches execution frequency
 
     // Get all ongoing tasks
     const ongoingTasks = await db.collection(Collections.TASKS)
@@ -41,8 +42,9 @@ export const checkDeadlines = onSchedule(
 
       const timeUntilDeadline = deadlineMs - nowMs;
 
-      // 24-hour reminder only (between 23-24 hours before deadline)
-      if (timeUntilDeadline > oneDayMs - oneHourMs && timeUntilDeadline <= oneDayMs) {
+      // 24-hour reminder (between 20-24 hours before deadline)
+      // Wider window ensures no tasks are missed with 4-hour check frequency
+      if (timeUntilDeadline > oneDayMs - fourHoursMs && timeUntilDeadline <= oneDayMs) {
         reminderPromises.push(sendDeadlineReminder(taskId, task));
       }
     }
@@ -245,35 +247,6 @@ export const cleanupInactiveTracking = onSchedule(
     console.log('Daily cleanup completed.');
   }
 );
-
-/**
- * Scheduled function: Keep critical functions warm
- * Runs every 5 minutes to prevent cold starts on user-facing functions
- * This warms the Node.js runtime, Firebase Admin SDK, and Firestore connection
- */
-export const keepCriticalFunctionsWarm = onSchedule(
-  { schedule: 'every 5 minutes', ...scheduleConfig },
-  async () => {
-    // Make minimal Firestore read to warm DB connection
-    // This warms the same infrastructure that callable functions use
-    const warmupDoc = await db.collection('_warmup').doc('ping').get();
-
-    if (!warmupDoc.exists) {
-      // Create warmup doc if it doesn't exist
-      await db.collection('_warmup').doc('ping').set({
-        lastPing: admin.firestore.FieldValue.serverTimestamp(),
-      });
-    } else {
-      // Update timestamp to prove activity
-      await db.collection('_warmup').doc('ping').update({
-        lastPing: admin.firestore.FieldValue.serverTimestamp(),
-      });
-    }
-
-    console.log('🔥 Warm-up ping executed at', new Date().toISOString());
-  }
-);
-
 /**
  * Scheduled function: Maintain Google Calendar tokens
  * Runs on the 1st of every month at 3 AM to proactively refresh tokens
