@@ -64,17 +64,15 @@ service cloud.firestore {
       // Approved users can read teams
       allow read: if isApproved();
       
-      // Only Super Admin can create teams
+      // Only Super Admin can create teams (via Cloud Function)
       allow create: if isSuperAdmin();
       
-      // Super Admin or Team Admin of this team can update
-      allow update: if isApproved() && (
-        isSuperAdmin() || 
-        resource.data.adminId == request.auth.uid
-      );
+      // All team updates go through Cloud Functions (Admin SDK bypasses rules)
+      // This prevents direct client writes that could bypass field-level restrictions
+      allow update: if false;
       
-      // Only Super Admin can delete teams
-      allow delete: if isSuperAdmin();
+      // Only Super Admin can delete teams (via Cloud Function)
+      allow delete: if false;
     }
     
     // ============================================
