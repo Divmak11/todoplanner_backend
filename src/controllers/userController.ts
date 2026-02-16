@@ -138,6 +138,15 @@ export const updateUserRole = onCall(
     const userId = validateRequiredString(data.userId, 'userId');
     const newRole = validateRole(data.newRole);
 
+    // Team Admin role is derived from team.adminId — cannot be set manually
+    if (newRole === UserRole.TEAM_ADMIN) {
+      throw new HttpsError(
+        'invalid-argument',
+        'Team Admin role is managed automatically via team administration. ' +
+        'Assign a user as team admin through the Edit Team screen instead.'
+      );
+    }
+
     // Prevent changing own role
     if (userId === adminId) {
       throw new HttpsError(
@@ -158,37 +167,19 @@ export const updateUserRole = onCall(
       return { success: true, message: 'Role unchanged' };
     }
 
-    const batch = db.batch();
-
-    // If user was Team Admin and is being demoted, clear adminId from their teams
-    if (oldRole === UserRole.TEAM_ADMIN && newRole !== UserRole.TEAM_ADMIN) {
-      const teamsSnapshot = await db
-        .collection(Collections.TEAMS)
-        .where('adminId', '==', userId)
-        .get();
-
-      teamsSnapshot.docs.forEach((doc: admin.firestore.QueryDocumentSnapshot) => {
-        batch.update(doc.ref, { adminId: null });
-      });
-    }
-
     // Update user role
-    batch.update(db.collection(Collections.USERS).doc(userId), {
+    await db.collection(Collections.USERS).doc(userId).update({
       role: newRole,
       roleUpdatedBy: adminId,
       roleUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
-
-    await batch.commit();
 
     // Update custom claims
     await auth.setCustomUserClaims(userId, { role: newRole });
 
     // Notify user of role change
     const roleDisplay =
-      newRole === UserRole.SUPER_ADMIN ? 'Super Admin' :
-        newRole === UserRole.TEAM_ADMIN ? 'Team Admin' :
-          'Member';
+      newRole === UserRole.SUPER_ADMIN ? 'Super Admin' : 'Member';
     await sendNotification(
       userId,
       '🔄 Role Updated',
@@ -480,14 +471,6 @@ export const deleteOwnAccount = onCall(
     }
 
     const user = userDoc.data()!;
-
-    // Super admins cannot delete themselves (safety measure)
-    if (user.role === UserRole.SUPER_ADMIN) {
-      throw new HttpsError(
-        'failed-precondition',
-        'Super Admin accounts cannot be self-deleted. Contact another Super Admin.'
-      );
-    }
 
     const batch = db.batch();
 
