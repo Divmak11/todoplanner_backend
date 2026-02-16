@@ -1,8 +1,8 @@
 import { onCall, HttpsError, CallableRequest } from 'firebase-functions/v2/https';
 import PDFDocument from 'pdfkit';
 import { admin, db } from '../config/firebase-admin';
-import { Collections } from '../config/constants';
-import { validateSuperAdminAsync } from '../utils/validators';
+import { UserRole, Collections } from '../config/constants';
+import { validateTeamAdminOrHigherAsync } from '../utils/validators';
 
 interface ExportReportInput {
     startDate: string; // ISO date string
@@ -21,7 +21,8 @@ const reportConfig = {
 
 /**
  * Export tasks report as PDF
- * Only Super Admin can export reports
+ * Super Admin: can export for all teams/members
+ * Team Admin: can export only for their teams' members
  */
 export const exportReport = onCall(
     reportConfig,
@@ -29,14 +30,54 @@ export const exportReport = onCall(
         const data = request.data;
         const context = { auth: request.auth };
 
-        // Validate caller is super admin
-        await validateSuperAdminAsync(context);
+        // Validate caller is at least a Team Admin
+        const { uid: callerUid, role: callerRole } = await validateTeamAdminOrHigherAsync(context);
+        const isSuperAdmin = callerRole === UserRole.SUPER_ADMIN;
 
         const startDate = data.startDate ? new Date(data.startDate) : null;
         const endDate = data.endDate ? new Date(data.endDate) : null;
-        const teamId = data.teamId || 'all';
+        let teamId = data.teamId || 'all';
         const status = data.status || 'all';
         const userId = data.userId || 'all'; // Member filter
+
+        // Team Admin scoping: restrict to their own teams
+        if (!isSuperAdmin) {
+            // Get teams where this user is the admin
+            const teamsSnapshot = await db.collection(Collections.TEAMS)
+                .where('adminId', '==', callerUid)
+                .get();
+            const adminTeamIds = teamsSnapshot.docs.map(d => d.id);
+
+            if (adminTeamIds.length === 0) {
+                throw new HttpsError('permission-denied', 'You are not an admin of any team');
+            }
+
+            // If Team Admin selected a specific team, verify they admin it
+            if (teamId !== 'all') {
+                if (!adminTeamIds.includes(teamId)) {
+                    throw new HttpsError('permission-denied', 'You can only generate reports for your own teams');
+                }
+            } else {
+                // If 'all' selected by Team Admin, scope to their first team
+                // (Team Admins typically admin one team)
+                teamId = adminTeamIds[0];
+            }
+
+            // If a specific member is selected, ensure they belong to one of the admin's teams
+            if (userId !== 'all') {
+                let memberBelongsToAdminTeam = false;
+                for (const tid of adminTeamIds) {
+                    const tDoc = await db.collection(Collections.TEAMS).doc(tid).get();
+                    if (tDoc.exists && (tDoc.data()!.memberIds || []).includes(userId)) {
+                        memberBelongsToAdminTeam = true;
+                        break;
+                    }
+                }
+                if (!memberBelongsToAdminTeam) {
+                    throw new HttpsError('permission-denied', 'The selected member is not in your team');
+                }
+            }
+        }
 
         try {
             // Build Firestore query
@@ -158,6 +199,50 @@ export const exportReport = onCall(
                 }
             }
 
+            // =========== RESCHEDULE METRICS ===========
+            // Query reschedule logs for the tasks in our result set
+            const taskIds = tasks.map((t: any) => t.id);
+            const rescheduleMap: Record<string, number> = {}; // taskId -> count
+            const userRescheduleMap: Record<string, number> = {}; // userId -> count
+
+            if (taskIds.length > 0) {
+                // Firestore 'in' queries support max 30 values, so batch if needed
+                const batchSize = 30;
+                for (let i = 0; i < taskIds.length; i += batchSize) {
+                    const batchIds = taskIds.slice(i, i + batchSize);
+                    let rescheduleQuery: admin.firestore.Query = db.collection(Collections.RESCHEDULE_LOG)
+                        .where('taskId', 'in', batchIds);
+
+                    // Optionally filter by date range
+                    if (startDate && endDate) {
+                        // Note: can't combine 'in' with range on different field in Firestore
+                        // So we do client-side date filtering
+                    }
+
+                    const rescheduleSnapshot = await rescheduleQuery.get();
+                    rescheduleSnapshot.docs.forEach((doc) => {
+                        const log = doc.data();
+                        const logDate = log.createdAt?.toDate ? log.createdAt.toDate() : null;
+
+                        // Client-side date filtering
+                        if (startDate && endDate && logDate) {
+                            if (logDate < startDate || logDate > endDate) return;
+                        }
+
+                        const tId = log.taskId as string;
+                        const rBy = log.requestedBy as string;
+
+                        rescheduleMap[tId] = (rescheduleMap[tId] || 0) + 1;
+                        if (rBy) {
+                            userRescheduleMap[rBy] = (userRescheduleMap[rBy] || 0) + 1;
+                        }
+                    });
+                }
+            }
+
+            const totalReschedules = Object.values(rescheduleMap).reduce((sum, c) => sum + c, 0);
+            const tasksRescheduled = Object.keys(rescheduleMap).length;
+
             // Generate PDF
             const pdfBuffer = await generateTasksPDF(tasks, usersMap, {
                 startDate,
@@ -167,6 +252,11 @@ export const exportReport = onCall(
                 status,
                 userId,
                 memberName,
+            }, {
+                rescheduleMap,
+                userRescheduleMap,
+                totalReschedules,
+                tasksRescheduled,
             });
 
             // Return PDF as base64
@@ -191,7 +281,13 @@ export const exportReport = onCall(
 async function generateTasksPDF(
     tasks: any[],
     usersMap: Record<string, string>,
-    filters: any
+    filters: any,
+    rescheduleData: {
+        rescheduleMap: Record<string, number>;
+        userRescheduleMap: Record<string, number>;
+        totalReschedules: number;
+        tasksRescheduled: number;
+    }
 ): Promise<Buffer> {
     return new Promise((resolve, reject) => {
         const doc = new PDFDocument({ margin: 40, size: 'A4', bufferPages: true });
@@ -215,6 +311,8 @@ async function generateTasksPDF(
         const darkGray = '#374151';
         const lightGray = '#f8fafc';
         const borderGray = '#e2e8f0';
+        const orange = '#ea580c';
+        const lightOrange = '#fff7ed';
 
         const pageWidth = 595;
         const contentWidth = pageWidth - 80; // 40px margin on each side
@@ -306,6 +404,94 @@ async function generateTasksPDF(
 
         y = cardY + cardHeight + 25;
 
+        // =========== RESCHEDULE INSIGHTS SECTION ===========
+        if (rescheduleData.totalReschedules > 0) {
+            // Section title
+            doc.fontSize(14).font('Helvetica-Bold').fillColor(orange).text('Reschedule Insights', 40, y);
+            y += 22;
+
+            // Summary stats row
+            const rescheduleRate = tasks.length > 0
+                ? ((rescheduleData.tasksRescheduled / tasks.length) * 100).toFixed(0)
+                : '0';
+
+            const rCardWidth = (contentWidth - 20) / 3;
+            const rCardHeight = 55;
+
+            // Card 1: Total Reschedules
+            doc.rect(40, y, rCardWidth, rCardHeight).fill(lightOrange);
+            doc.rect(40, y, rCardWidth, 3).fill(orange);
+            doc.fontSize(20).font('Helvetica-Bold').fillColor(orange)
+                .text(String(rescheduleData.totalReschedules), 50, y + 14, { width: rCardWidth - 20 });
+            doc.fontSize(8).font('Helvetica').fillColor(darkGray)
+                .text('Total Reschedules', 50, y + 38, { width: rCardWidth - 20 });
+
+            // Card 2: Tasks Rescheduled
+            const rx2 = 40 + rCardWidth + 10;
+            doc.rect(rx2, y, rCardWidth, rCardHeight).fill(lightOrange);
+            doc.rect(rx2, y, rCardWidth, 3).fill(orange);
+            doc.fontSize(20).font('Helvetica-Bold').fillColor(orange)
+                .text(String(rescheduleData.tasksRescheduled), rx2 + 10, y + 14, { width: rCardWidth - 20 });
+            doc.fontSize(8).font('Helvetica').fillColor(darkGray)
+                .text('Tasks Rescheduled', rx2 + 10, y + 38, { width: rCardWidth - 20 });
+
+            // Card 3: Reschedule Rate
+            const rx3 = 40 + (rCardWidth + 10) * 2;
+            doc.rect(rx3, y, rCardWidth, rCardHeight).fill(lightOrange);
+            doc.rect(rx3, y, rCardWidth, 3).fill(orange);
+            doc.fontSize(20).font('Helvetica-Bold').fillColor(orange)
+                .text(`${rescheduleRate}%`, rx3 + 10, y + 14, { width: rCardWidth - 20 });
+            doc.fontSize(8).font('Helvetica').fillColor(darkGray)
+                .text('Reschedule Rate', rx3 + 10, y + 38, { width: rCardWidth - 20 });
+
+            y += rCardHeight + 15;
+
+            // Per-user reschedule table (only if team/all report, not single user)
+            const usersWithReschedules = Object.entries(rescheduleData.userRescheduleMap);
+            if (usersWithReschedules.length > 0 && (filters.userId === 'all' || !filters.userId)) {
+                // Check page space
+                if (y > 650) {
+                    doc.addPage();
+                    y = 50;
+                }
+
+                doc.fontSize(10).font('Helvetica-Bold').fillColor(darkGray)
+                    .text('Per-User Reschedule Breakdown', 40, y);
+                y += 18;
+
+                // Table header
+                doc.rect(40, y, contentWidth, 20).fill('#f1f5f9');
+                doc.fontSize(8).font('Helvetica-Bold').fillColor(darkGray);
+                doc.text('User', 50, y + 6, { width: 200 });
+                doc.text('Reschedules', 260, y + 6, { width: 80, align: 'center' });
+                doc.text('Tasks Affected', 350, y + 6, { width: 80, align: 'center' });
+                y += 20;
+
+                for (const [uid, count] of usersWithReschedules) {
+                    if (y > 730) {
+                        doc.addPage();
+                        y = 50;
+                    }
+
+                    const userName = usersMap[uid] || 'Unknown';
+                    doc.rect(40, y, contentWidth, 18).fill(y % 2 === 0 ? '#ffffff' : '#fafafa');
+                    doc.fontSize(8).font('Helvetica').fillColor(darkGray);
+                    doc.text(userName, 50, y + 5, { width: 200, lineBreak: false, ellipsis: true });
+                    doc.text(String(count), 260, y + 5, { width: 80, align: 'center' });
+
+                    // Count how many unique tasks this user rescheduled
+                    // (We don't have per-user-per-task data in the aggregated map,
+                    //  so we show the total reschedule count per user)
+                    doc.text('-', 350, y + 5, { width: 80, align: 'center' });
+                    y += 18;
+                }
+
+                y += 10;
+            }
+
+            y += 10;
+        }
+
         // =========== TASKS SECTION TITLE ===========
         doc.fontSize(14).font('Helvetica-Bold').fillColor(darkBlue).text('Task Details', 40, y);
         y += 25;
@@ -328,6 +514,7 @@ async function generateTasksPDF(
                 const deadline = task.deadline?.toDate ? task.deadline.toDate() : null;
                 const createdAt = task.createdAt?.toDate ? task.createdAt.toDate() : null;
                 const completedAt = task.completedAt?.toDate ? task.completedAt.toDate() : null;
+                const taskRescheduleCount = rescheduleData.rescheduleMap[task.id] || 0;
 
                 // Check if overdue
                 const isOverdue = status === 'ongoing' && deadline && deadline < now;
@@ -383,6 +570,18 @@ async function generateTasksPDF(
                     40 + contentWidth - badgeWidth - 10, y + 15,
                     { width: badgeWidth, align: 'center' }
                 );
+
+                // Reschedule badge (below status badge)
+                if (taskRescheduleCount > 0) {
+                    const rescheduleLabel = `${taskRescheduleCount}x Rescheduled`;
+                    const rBadgeWidth = doc.widthOfString(rescheduleLabel) + 16;
+                    doc.rect(40 + contentWidth - rBadgeWidth - 10, y + 32, rBadgeWidth, 16).fill(lightOrange);
+                    doc.fontSize(7).font('Helvetica-Bold').fillColor(orange).text(
+                        rescheduleLabel,
+                        40 + contentWidth - rBadgeWidth - 10, y + 35,
+                        { width: rBadgeWidth, align: 'center' }
+                    );
+                }
 
                 // Subtitle/Description - Aggressively cleaning and forcing single line
                 let subtitleY = y + 36;

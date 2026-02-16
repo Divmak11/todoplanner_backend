@@ -100,6 +100,31 @@ export function validateTeamAdminOrHigher(context: AuthContext): string {
 }
 
 /**
+ * Validates that a user is at least a Team Admin (async with Firestore fallback)
+ * Returns { uid, role } so caller can check if user is superAdmin vs teamAdmin
+ */
+export async function validateTeamAdminOrHigherAsync(
+  context: AuthContext
+): Promise<{ uid: string; role: string }> {
+  const uid = validateAuthenticated(context);
+
+  // Check custom claims first
+  const claimRole = context.auth?.token?.role;
+  if (claimRole === UserRole.SUPER_ADMIN || claimRole === UserRole.TEAM_ADMIN) {
+    return { uid, role: claimRole };
+  }
+
+  // Fallback: Check Firestore document
+  const userDoc = await db.collection(Collections.USERS).doc(uid).get();
+  const firestoreRole = userDoc.exists ? userDoc.data()?.role : undefined;
+  if (firestoreRole === UserRole.SUPER_ADMIN || firestoreRole === UserRole.TEAM_ADMIN) {
+    return { uid, role: firestoreRole };
+  }
+
+  throw new HttpsError('permission-denied', 'Only Team Admin or Super Admin can perform this action');
+}
+
+/**
  * Validates that a string is not empty
  */
 export function validateRequiredString(value: unknown, fieldName: string): string {
