@@ -1,7 +1,7 @@
 import { onCall, HttpsError, CallableRequest } from 'firebase-functions/v2/https';
 import PDFDocument from 'pdfkit';
 import { admin, db } from '../config/firebase-admin';
-import { UserRole, Collections } from '../config/constants';
+import { UserRole, Collections, ConfigDocs } from '../config/constants';
 import { validateTeamAdminOrHigherAsync } from '../utils/validators';
 
 interface ExportReportInput {
@@ -9,7 +9,8 @@ interface ExportReportInput {
     endDate: string; // ISO date string
     teamId?: string;
     status?: string;
-    userId?: string; // Add member filter
+    userId?: string; // Single member filter (legacy)
+    memberIds?: string[]; // All active member IDs for per-user grouping
 }
 
 // 2nd Gen configuration for report function - increased memory for PDF generation
@@ -23,6 +24,11 @@ const reportConfig = {
  * Export tasks report as PDF
  * Super Admin: can export for all teams/members
  * Team Admin: can export only for their teams' members
+ * 
+ * Report structure:
+ * 1. Executive Summary: overall task counts, per-status breakdown, user metrics
+ * 2. Per-User Sections: individual metrics + task list, ordered by task count (most → least)
+ * 3. Zero-task users are included at the bottom with an empty state message
  */
 export const exportReport = onCall(
     reportConfig,
@@ -38,7 +44,8 @@ export const exportReport = onCall(
         const endDate = data.endDate ? new Date(data.endDate) : null;
         let teamId = data.teamId || 'all';
         const status = data.status || 'all';
-        const userId = data.userId || 'all'; // Member filter
+        const userId = data.userId || 'all'; // Single member filter
+        const memberIds = data.memberIds || []; // All active member IDs from frontend
 
         // Team Admin scoping: restrict to their own teams
         if (!isSuperAdmin) {
@@ -102,18 +109,48 @@ export const exportReport = onCall(
                 ...doc.data(),
             }));
 
+            // =========== EXEMPT USER FILTERING ===========
+            // For non-Super Admin callers, filter out tasks assigned to exempt users.
+            // Single Firestore read per report — acceptable for infrequent operation.
+            // No caching (TTL=0) because each report must reflect the latest list.
+            if (!isSuperAdmin) {
+                const exemptDoc = await db
+                    .collection(Collections.CONFIG)
+                    .doc(ConfigDocs.REPORT_EXEMPT_USERS)
+                    .get();
+
+                if (exemptDoc.exists) {
+                    const exemptUserIds: string[] = exemptDoc.data()?.userIds || [];
+                    if (exemptUserIds.length > 0) {
+                        const exemptSet = new Set(exemptUserIds);
+                        tasks = tasks.filter((task: any) => {
+                            // Exclude if legacy assignedTo is exempt
+                            if (task.assignedTo && exemptSet.has(task.assignedTo)) return false;
+                            // Exclude if ALL assigneeIds are exempt (partial overlap = keep)
+                            if (task.assigneeIds && Array.isArray(task.assigneeIds)) {
+                                const nonExempt = task.assigneeIds.filter(
+                                    (id: string) => !exemptSet.has(id)
+                                );
+                                if (nonExempt.length === 0) return false;
+                            }
+                            return true;
+                        });
+                    }
+                }
+            }
+
             // Filter by team (only if no specific member is selected)
             // When a member is selected, team filter is ignored
             if (teamId !== 'all' && userId === 'all') {
                 const teamDoc = await db.collection(Collections.TEAMS).doc(teamId).get();
                 if (teamDoc.exists) {
-                    const memberIds = teamDoc.data()!.memberIds || [];
+                    const teamMemberIds = teamDoc.data()!.memberIds || [];
                     tasks = tasks.filter((task: any) => {
                         // Check legacy assignedTo
-                        if (memberIds.includes(task.assignedTo)) return true;
+                        if (teamMemberIds.includes(task.assignedTo)) return true;
                         // Check multi-assignee assigneeIds
                         if (task.assigneeIds && Array.isArray(task.assigneeIds)) {
-                            return task.assigneeIds.some((id: string) => memberIds.includes(id));
+                            return task.assigneeIds.some((id: string) => teamMemberIds.includes(id));
                         }
                         return false;
                     });
@@ -126,32 +163,17 @@ export const exportReport = onCall(
             }
 
             // Filter by member (individual user) - only show tasks where they are ASSIGNEE (not creator)
-            // This makes the member report show only tasks assigned to them
             if (userId !== 'all') {
                 tasks = tasks.filter((task: any) => {
-                    // Include tasks where user is assignedTo (legacy)
                     if (task.assignedTo === userId) return true;
-                    // Include tasks where user is in assigneeIds (multi-assignee)
                     if (task.assigneeIds && Array.isArray(task.assigneeIds) && task.assigneeIds.includes(userId)) return true;
-                    // Note: NOT including tasks they created - those go to different view
                     return false;
                 });
             }
 
-            // Sort tasks by status: ongoing → completed → cancelled
-            const statusOrder: Record<string, number> = { 'ongoing': 0, 'completed': 1, 'cancelled': 2 };
-            tasks.sort((a: any, b: any) => {
-                const orderA = statusOrder[a.status] ?? 3;
-                const orderB = statusOrder[b.status] ?? 3;
-                if (orderA !== orderB) return orderA - orderB;
-                // Within same status, sort by deadline (most recent first)
-                const deadlineA = a.deadline?.toDate?.() ?? new Date(0);
-                const deadlineB = b.deadline?.toDate?.() ?? new Date(0);
-                return deadlineB.getTime() - deadlineA.getTime();
-            });
-
-            // Fetch user data for assignee names
-            const allUserIds = new Set<string>();
+            // =========== BUILD USER DATA ===========
+            // Fetch all member names (from memberIds or from tasks)
+            const allUserIds = new Set<string>(memberIds);
             tasks.forEach((task: any) => {
                 if (task.assignedTo) allUserIds.add(task.assignedTo);
                 if (task.assigneeIds && Array.isArray(task.assigneeIds)) {
@@ -159,31 +181,20 @@ export const exportReport = onCall(
                 }
             });
 
-            const userIds = Array.from(allUserIds).filter(id => id); // Filter out empty/null
+            const userIdsList = Array.from(allUserIds).filter(id => id);
             const usersMap: Record<string, string> = {};
 
-            for (const userId of userIds) {
-                try {
-                    const userDoc = await db.collection(Collections.USERS).doc(userId).get();
-                    if (userDoc.exists) {
-                        usersMap[userId] = userDoc.data()!.name || 'Unknown';
+            // Batch fetch users (max 10 per batch for Firestore getAll)
+            const batchSize = 10;
+            for (let i = 0; i < userIdsList.length; i += batchSize) {
+                const batch = userIdsList.slice(i, i + batchSize);
+                const refs = batch.map(uid => db.collection(Collections.USERS).doc(uid));
+                const docs = await db.getAll(...refs);
+                docs.forEach(doc => {
+                    if (doc.exists) {
+                        usersMap[doc.id] = doc.data()!.name || 'Unknown';
                     }
-                } catch (e) {
-                    console.warn(`Failed to fetch user ${userId}:`, e);
-                }
-            }
-
-            // Also fetch the member name if a specific member filter was applied
-            let memberName = '';
-            if (userId !== 'all') {
-                try {
-                    const memberDoc = await db.collection(Collections.USERS).doc(userId).get();
-                    if (memberDoc.exists) {
-                        memberName = memberDoc.data()!.name || 'Unknown Member';
-                    }
-                } catch (e) {
-                    memberName = 'Unknown Member';
-                }
+                });
             }
 
             // Fetch team name if team filter was applied
@@ -200,24 +211,18 @@ export const exportReport = onCall(
             }
 
             // =========== RESCHEDULE METRICS ===========
-            // Query reschedule logs for the tasks in our result set
             const taskIds = tasks.map((t: any) => t.id);
             const rescheduleMap: Record<string, number> = {}; // taskId -> count
             const userRescheduleMap: Record<string, number> = {}; // userId -> count
+            // Store previous deadlines per task for display
+            const taskRescheduleHistory: Record<string, { previousDeadline: Date; newDeadline: Date; requestedBy: string }[]> = {};
 
             if (taskIds.length > 0) {
-                // Firestore 'in' queries support max 30 values, so batch if needed
-                const batchSize = 30;
-                for (let i = 0; i < taskIds.length; i += batchSize) {
-                    const batchIds = taskIds.slice(i, i + batchSize);
-                    let rescheduleQuery: admin.firestore.Query = db.collection(Collections.RESCHEDULE_LOG)
+                const reschBatchSize = 30;
+                for (let i = 0; i < taskIds.length; i += reschBatchSize) {
+                    const batchIds = taskIds.slice(i, i + reschBatchSize);
+                    const rescheduleQuery: admin.firestore.Query = db.collection(Collections.RESCHEDULE_LOG)
                         .where('taskId', 'in', batchIds);
-
-                    // Optionally filter by date range
-                    if (startDate && endDate) {
-                        // Note: can't combine 'in' with range on different field in Firestore
-                        // So we do client-side date filtering
-                    }
 
                     const rescheduleSnapshot = await rescheduleQuery.get();
                     rescheduleSnapshot.docs.forEach((doc) => {
@@ -236,6 +241,14 @@ export const exportReport = onCall(
                         if (rBy) {
                             userRescheduleMap[rBy] = (userRescheduleMap[rBy] || 0) + 1;
                         }
+
+                        // Store reschedule history for display
+                        if (!taskRescheduleHistory[tId]) taskRescheduleHistory[tId] = [];
+                        taskRescheduleHistory[tId].push({
+                            previousDeadline: log.previousDeadline?.toDate ? log.previousDeadline.toDate() : new Date(),
+                            newDeadline: log.newDeadline?.toDate ? log.newDeadline.toDate() : new Date(),
+                            requestedBy: rBy,
+                        });
                     });
                 }
             }
@@ -243,21 +256,77 @@ export const exportReport = onCall(
             const totalReschedules = Object.values(rescheduleMap).reduce((sum, c) => sum + c, 0);
             const tasksRescheduled = Object.keys(rescheduleMap).length;
 
-            // Generate PDF
-            const pdfBuffer = await generateTasksPDF(tasks, usersMap, {
-                startDate,
-                endDate,
-                teamId,
-                teamName,
-                status,
-                userId,
-                memberName,
-            }, {
-                rescheduleMap,
-                userRescheduleMap,
-                totalReschedules,
-                tasksRescheduled,
+            // =========== BUILD PER-USER TASK GROUPS ===========
+            // Determine which users to include in the report
+            const reportUserIds = memberIds.length > 0
+                ? memberIds
+                : Array.from(allUserIds).filter(id => id);
+
+            // Group tasks by assignee
+            const userTasksMap: Record<string, any[]> = {};
+            for (const uid of reportUserIds) {
+                userTasksMap[uid] = [];
+            }
+
+            tasks.forEach((task: any) => {
+                // Assign task to the primary assignee (legacy)
+                if (task.assignedTo && userTasksMap[task.assignedTo] !== undefined) {
+                    userTasksMap[task.assignedTo].push(task);
+                }
+                // Also assign to multi-assignees (avoid duplicates for legacy assignedTo)
+                if (task.assigneeIds && Array.isArray(task.assigneeIds)) {
+                    task.assigneeIds.forEach((id: string) => {
+                        if (id !== task.assignedTo && userTasksMap[id] !== undefined) {
+                            userTasksMap[id].push(task);
+                        }
+                    });
+                }
             });
+
+            // Sort users by task count (most tasks first), zero-task users at the end
+            const sortedUserIds = reportUserIds.sort((a, b) => {
+                const aCount = userTasksMap[a]?.length || 0;
+                const bCount = userTasksMap[b]?.length || 0;
+                return bCount - aCount; // Descending — most tasks first
+            });
+
+            // Sort tasks within each user by status priority
+            const statusOrder: Record<string, number> = { 'ongoing': 0, 'completed': 1, 'cancelled': 2 };
+            for (const uid of sortedUserIds) {
+                if (userTasksMap[uid]) {
+                    userTasksMap[uid].sort((a: any, b: any) => {
+                        const orderA = statusOrder[a.status] ?? 3;
+                        const orderB = statusOrder[b.status] ?? 3;
+                        if (orderA !== orderB) return orderA - orderB;
+                        const deadlineA = a.deadline?.toDate?.() ?? new Date(0);
+                        const deadlineB = b.deadline?.toDate?.() ?? new Date(0);
+                        return deadlineB.getTime() - deadlineA.getTime();
+                    });
+                }
+            }
+
+            // Generate PDF
+            const pdfBuffer = await generateTasksPDF(
+                sortedUserIds,
+                userTasksMap,
+                usersMap,
+                {
+                    startDate,
+                    endDate,
+                    teamId,
+                    teamName,
+                    status,
+                    userId,
+                },
+                {
+                    rescheduleMap,
+                    userRescheduleMap,
+                    totalReschedules,
+                    tasksRescheduled,
+                    taskRescheduleHistory,
+                },
+                tasks.length
+            );
 
             // Return PDF as base64
             return {
@@ -276,10 +345,18 @@ export const exportReport = onCall(
 );
 
 /**
- * Generate PDF document from tasks data with professional design
+ * Generate PDF document with per-user grouped tasks and executive summary.
+ *
+ * Layout:
+ * - Header with branding
+ * - Filter info
+ * - Executive Summary (overall stats)
+ * - Per-User Sections: user header → individual metrics → task cards
+ * - Footer with page numbers
  */
 async function generateTasksPDF(
-    tasks: any[],
+    sortedUserIds: string[],
+    userTasksMap: Record<string, any[]>,
     usersMap: Record<string, string>,
     filters: any,
     rescheduleData: {
@@ -287,366 +364,377 @@ async function generateTasksPDF(
         userRescheduleMap: Record<string, number>;
         totalReschedules: number;
         tasksRescheduled: number;
-    }
+        taskRescheduleHistory: Record<string, { previousDeadline: Date; newDeadline: Date; requestedBy: string }[]>;
+    },
+    totalTaskCount: number
 ): Promise<Buffer> {
     return new Promise((resolve, reject) => {
         const doc = new PDFDocument({ margin: 40, size: 'A4', bufferPages: true });
         const chunks: Buffer[] = [];
 
-        // Collect PDF data
         doc.on('data', (chunk: Buffer) => chunks.push(chunk));
         doc.on('end', () => resolve(Buffer.concat(chunks)));
         doc.on('error', reject);
 
-        // Colors
-        const primaryBlue = '#1e40af';
-        const darkBlue = '#1e3a8a';
-        const green = '#16a34a';
-        const lightGreen = '#dcfce7';
-        const yellow = '#ca8a04';
-        const lightYellow = '#fef9c3';
-        const red = '#dc2626';
-        const lightRed = '#fee2e2';
-        const gray = '#64748b';
-        const darkGray = '#374151';
-        const lightGray = '#f8fafc';
-        const borderGray = '#e2e8f0';
-        const orange = '#ea580c';
-        const lightOrange = '#fff7ed';
+        // ===== PROFESSIONAL COLOR PALETTE =====
+        // Primary — deep navy + slate
+        const navy = '#1a2332';
+        const slateBlue = '#334155';
+        const slate500 = '#64748b';
+        const slate400 = '#94a3b8';
+        const slate200 = '#e2e8f0';
+        const slate100 = '#f1f5f9';
+        const slate50 = '#f8fafc';
+
+        // Semantic — muted, professional tones
+        const successGreen = '#15803d';
+        const successBg = '#f0fdf4';
+        const warningAmber = '#b45309';
+        const warningBg = '#fffbeb';
+        const dangerRed = '#b91c1c';
+        const dangerBg = '#fef2f2';
+        const infoBlue = '#1d4ed8';
+        const accentTeal = '#0f766e';
+
+        const white = '#ffffff';
 
         const pageWidth = 595;
-        const contentWidth = pageWidth - 80; // 40px margin on each side
-
-        // =========== HEADER ===========
-        doc.rect(0, 0, pageWidth, 100).fill(primaryBlue);
-
-        // Company/App name
-        doc.fontSize(24).font('Helvetica-Bold').fillColor('white').text('TODO: Manager', 40, 30);
-        doc.fontSize(11).font('Helvetica').fillColor('#93c5fd').text('Task Management Report', 40, 58);
-
-        // Generation date on top right
-        doc.fontSize(9).fillColor('#bfdbfe').text(
-            `Generated: ${new Date().toLocaleDateString('en-US', {
-                weekday: 'short',
-                month: 'short',
-                day: 'numeric',
-                year: 'numeric',
-                hour: '2-digit',
-                minute: '2-digit'
-            })}`,
-            pageWidth - 200, 40, { width: 160, align: 'right' }
-        );
-
-        let y = 120;
-
-        // =========== REPORT FILTERS INFO ===========
-        doc.fontSize(10).font('Helvetica').fillColor(darkGray);
-
-        if (filters.startDate && filters.endDate) {
-            const startStr = filters.startDate.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' });
-            const endStr = filters.endDate.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' });
-            doc.font('Helvetica-Bold').text('Period: ', 40, y, { continued: true });
-            doc.font('Helvetica').text(`${startStr} — ${endStr}`);
-            y += 18;
-        }
-
-        if (filters.status && filters.status !== 'all') {
-            doc.font('Helvetica-Bold').text('Status Filter: ', 40, y, { continued: true });
-            doc.font('Helvetica').text(filters.status.charAt(0).toUpperCase() + filters.status.slice(1));
-            y += 18;
-        }
-
-        if (filters.teamId && filters.teamId !== 'all') {
-            doc.font('Helvetica-Bold').text('Team: ', 40, y, { continued: true });
-            doc.font('Helvetica').text(filters.teamName || 'Specific Team');
-            y += 18;
-        }
-
-        // Show member name if filtered by member
-        if (filters.userId && filters.userId !== 'all') {
-            doc.font('Helvetica-Bold').text('Member: ', 40, y, { continued: true });
-            doc.font('Helvetica').text(filters.memberName || 'Specific Member');
-            y += 18;
-        }
-
-        y += 15;
-
-        // =========== SUMMARY STATISTICS CARDS ===========
-        const completedCount = tasks.filter((t) => t.status === 'completed').length;
-        const ongoingCount = tasks.filter((t) => t.status === 'ongoing').length;
+        const contentWidth = pageWidth - 80; // 40px margin each side
+        const ml = 40; // margin left
         const now = new Date();
-        const overdueCount = tasks.filter((t) => {
-            if (t.status !== 'ongoing') return false;
-            const deadline = t.deadline?.toDate ? t.deadline.toDate() : null;
-            return deadline && deadline < now;
-        }).length;
-        const completionRate = tasks.length > 0 ? ((completedCount / tasks.length) * 100).toFixed(0) : '0';
 
-        // Card dimensions
-        const cardWidth = (contentWidth - 30) / 4; // 4 cards with 10px gaps
-        const cardHeight = 65;
-        const cardY = y;
-
-        // Helper to draw stat card
-        const drawStatCard = (x: number, label: string, value: string, bgColor: string, textColor: string) => {
-            // Card background with rounded corners simulation
-            doc.rect(x, cardY, cardWidth, cardHeight).fill(bgColor);
-            doc.rect(x, cardY, cardWidth, 4).fill(textColor); // Top accent bar
-
-            doc.fontSize(22).font('Helvetica-Bold').fillColor(textColor).text(value, x + 10, cardY + 18, { width: cardWidth - 20 });
-            doc.fontSize(9).font('Helvetica').fillColor(darkGray).text(label, x + 10, cardY + 45, { width: cardWidth - 20 });
+        // Helper: ensure enough vertical space
+        const ensureSpace = (needed: number, currentY: number): number => {
+            if (currentY > 780 - needed) {
+                doc.addPage();
+                return 50;
+            }
+            return currentY;
         };
 
-        drawStatCard(40, 'Total Tasks', String(tasks.length), lightGray, primaryBlue);
-        drawStatCard(40 + cardWidth + 10, 'Completed', `${completedCount} (${completionRate}%)`, lightGreen, green);
-        drawStatCard(40 + (cardWidth + 10) * 2, 'In Progress', String(ongoingCount), lightYellow, yellow);
-        drawStatCard(40 + (cardWidth + 10) * 3, 'Overdue', String(overdueCount), overdueCount > 0 ? lightRed : lightGray, overdueCount > 0 ? red : gray);
+        // =========== HEADER ===========
+        doc.rect(0, 0, pageWidth, 80).fill(navy);
 
-        y = cardY + cardHeight + 25;
+        // Subtle bottom accent line
+        doc.rect(0, 80, pageWidth, 2).fill(slateBlue);
 
-        // =========== RESCHEDULE INSIGHTS SECTION ===========
-        if (rescheduleData.totalReschedules > 0) {
-            // Section title
-            doc.fontSize(14).font('Helvetica-Bold').fillColor(orange).text('Reschedule Insights', 40, y);
-            y += 22;
+        doc.fontSize(20).font('Helvetica-Bold').fillColor(white)
+            .text('TODO: Manager', ml, 22);
+        doc.fontSize(9).font('Helvetica').fillColor(slate400)
+            .text('Task Management Report', ml, 46);
 
-            // Summary stats row
-            const rescheduleRate = tasks.length > 0
-                ? ((rescheduleData.tasksRescheduled / tasks.length) * 100).toFixed(0)
-                : '0';
+        doc.fontSize(8).fillColor(slate400).text(
+            now.toLocaleDateString('en-US', {
+                weekday: 'short', month: 'short', day: 'numeric',
+                year: 'numeric', hour: '2-digit', minute: '2-digit'
+            }),
+            pageWidth - 180, 30, { width: 140, align: 'right' }
+        );
 
-            const rCardWidth = (contentWidth - 20) / 3;
-            const rCardHeight = 55;
+        let y = 100;
 
-            // Card 1: Total Reschedules
-            doc.rect(40, y, rCardWidth, rCardHeight).fill(lightOrange);
-            doc.rect(40, y, rCardWidth, 3).fill(orange);
-            doc.fontSize(20).font('Helvetica-Bold').fillColor(orange)
-                .text(String(rescheduleData.totalReschedules), 50, y + 14, { width: rCardWidth - 20 });
-            doc.fontSize(8).font('Helvetica').fillColor(darkGray)
-                .text('Total Reschedules', 50, y + 38, { width: rCardWidth - 20 });
+        // =========== REPORT FILTERS INFO ===========
+        if (filters.startDate || (filters.status && filters.status !== 'all') || (filters.teamId && filters.teamId !== 'all')) {
+            doc.rect(ml, y, contentWidth, 1).fill(slate200);
+            y += 10;
 
-            // Card 2: Tasks Rescheduled
-            const rx2 = 40 + rCardWidth + 10;
-            doc.rect(rx2, y, rCardWidth, rCardHeight).fill(lightOrange);
-            doc.rect(rx2, y, rCardWidth, 3).fill(orange);
-            doc.fontSize(20).font('Helvetica-Bold').fillColor(orange)
-                .text(String(rescheduleData.tasksRescheduled), rx2 + 10, y + 14, { width: rCardWidth - 20 });
-            doc.fontSize(8).font('Helvetica').fillColor(darkGray)
-                .text('Tasks Rescheduled', rx2 + 10, y + 38, { width: rCardWidth - 20 });
+            doc.fontSize(9).font('Helvetica').fillColor(slate500);
+            const filterParts: string[] = [];
 
-            // Card 3: Reschedule Rate
-            const rx3 = 40 + (rCardWidth + 10) * 2;
-            doc.rect(rx3, y, rCardWidth, rCardHeight).fill(lightOrange);
-            doc.rect(rx3, y, rCardWidth, 3).fill(orange);
-            doc.fontSize(20).font('Helvetica-Bold').fillColor(orange)
-                .text(`${rescheduleRate}%`, rx3 + 10, y + 14, { width: rCardWidth - 20 });
-            doc.fontSize(8).font('Helvetica').fillColor(darkGray)
-                .text('Reschedule Rate', rx3 + 10, y + 38, { width: rCardWidth - 20 });
-
-            y += rCardHeight + 15;
-
-            // Per-user reschedule table (only if team/all report, not single user)
-            const usersWithReschedules = Object.entries(rescheduleData.userRescheduleMap);
-            if (usersWithReschedules.length > 0 && (filters.userId === 'all' || !filters.userId)) {
-                // Check page space
-                if (y > 650) {
-                    doc.addPage();
-                    y = 50;
-                }
-
-                doc.fontSize(10).font('Helvetica-Bold').fillColor(darkGray)
-                    .text('Per-User Reschedule Breakdown', 40, y);
-                y += 18;
-
-                // Table header
-                doc.rect(40, y, contentWidth, 20).fill('#f1f5f9');
-                doc.fontSize(8).font('Helvetica-Bold').fillColor(darkGray);
-                doc.text('User', 50, y + 6, { width: 200 });
-                doc.text('Reschedules', 260, y + 6, { width: 80, align: 'center' });
-                doc.text('Tasks Affected', 350, y + 6, { width: 80, align: 'center' });
-                y += 20;
-
-                for (const [uid, count] of usersWithReschedules) {
-                    if (y > 730) {
-                        doc.addPage();
-                        y = 50;
-                    }
-
-                    const userName = usersMap[uid] || 'Unknown';
-                    doc.rect(40, y, contentWidth, 18).fill(y % 2 === 0 ? '#ffffff' : '#fafafa');
-                    doc.fontSize(8).font('Helvetica').fillColor(darkGray);
-                    doc.text(userName, 50, y + 5, { width: 200, lineBreak: false, ellipsis: true });
-                    doc.text(String(count), 260, y + 5, { width: 80, align: 'center' });
-
-                    // Count how many unique tasks this user rescheduled
-                    // (We don't have per-user-per-task data in the aggregated map,
-                    //  so we show the total reschedule count per user)
-                    doc.text('-', 350, y + 5, { width: 80, align: 'center' });
-                    y += 18;
-                }
-
-                y += 10;
+            if (filters.startDate && filters.endDate) {
+                const sStr = filters.startDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+                const eStr = filters.endDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+                filterParts.push(`Period: ${sStr} - ${eStr}`);
+            }
+            if (filters.status && filters.status !== 'all') {
+                filterParts.push(`Status: ${filters.status.charAt(0).toUpperCase() + filters.status.slice(1)}`);
+            }
+            if (filters.teamId && filters.teamId !== 'all') {
+                filterParts.push(`Team: ${filters.teamName || 'Selected'}`);
             }
 
-            y += 10;
+            doc.text(filterParts.join('   |   '), ml, y, { width: contentWidth });
+            y += 20;
         }
 
-        // =========== TASKS SECTION TITLE ===========
-        doc.fontSize(14).font('Helvetica-Bold').fillColor(darkBlue).text('Task Details', 40, y);
-        y += 25;
+        y += 8;
 
-        // =========== TASK CARDS ===========
-        if (tasks.length === 0) {
-            doc.fontSize(11).font('Helvetica').fillColor(gray).text('No tasks found for the selected filters.', 40, y);
-        } else {
-            for (const task of tasks) {
-                // Check if we need a new page (need at least 100px for a card)
-                if (y > 680) {
-                    doc.addPage();
-                    y = 50;
-                }
+        // =========== EXECUTIVE SUMMARY ===========
+        doc.fontSize(13).font('Helvetica-Bold').fillColor(navy).text('Executive Summary', ml, y);
+        y += 22;
+
+        // Calculate overall stats
+        const allTasks: any[] = [];
+        Object.values(userTasksMap).forEach(tasks => {
+            tasks.forEach(task => {
+                if (!allTasks.find(t => t.id === task.id)) allTasks.push(task);
+            });
+        });
+
+        const completedCount = allTasks.filter(t => t.status === 'completed').length;
+        const ongoingCount = allTasks.filter(t => t.status === 'ongoing').length;
+        const cancelledCount = allTasks.filter(t => t.status === 'cancelled').length;
+        const overdueCount = allTasks.filter(t => {
+            if (t.status !== 'ongoing') return false;
+            const deadl = t.deadline?.toDate ? t.deadline.toDate() : null;
+            return deadl && deadl < now;
+        }).length;
+        const activeNonOverdue = ongoingCount - overdueCount;
+        const completionRate = totalTaskCount > 0 ? ((completedCount / totalTaskCount) * 100).toFixed(0) : '0';
+        const usersWithZeroTasks = sortedUserIds.filter(uid => (userTasksMap[uid]?.length || 0) === 0).length;
+
+        // ---- Stat cards: clean border-based design ----
+        const cardW = (contentWidth - 16) / 3; // gap = 8 between
+        const cardH = 52;
+
+        const drawStatCard = (x: number, yp: number, label: string, value: string, accent: string, hasAlert: boolean = false) => {
+            // White card with left accent border
+            doc.rect(x, yp, cardW, cardH).fill(white);
+            doc.rect(x, yp, cardW, cardH).lineWidth(0.5).stroke(slate200);
+            doc.rect(x, yp, 3, cardH).fill(accent);
+
+            doc.fontSize(20).font('Helvetica-Bold').fillColor(hasAlert ? accent : slateBlue)
+                .text(value, x + 12, yp + 10, { width: cardW - 20 });
+            doc.fontSize(7.5).font('Helvetica').fillColor(slate500)
+                .text(label, x + 12, yp + 35, { width: cardW - 20 });
+        };
+
+        // Row 1
+        drawStatCard(ml, y, 'Total Tasks', String(totalTaskCount), infoBlue);
+        drawStatCard(ml + cardW + 8, y, `Completed (${completionRate}%)`, String(completedCount), successGreen);
+        drawStatCard(ml + (cardW + 8) * 2, y, 'Active', String(activeNonOverdue), warningAmber);
+        y += cardH + 6;
+
+        // Row 2
+        drawStatCard(ml, y, 'Overdue', String(overdueCount), dangerRed, overdueCount > 0);
+        drawStatCard(ml + cardW + 8, y, 'Cancelled', String(cancelledCount), dangerRed, cancelledCount > 0);
+        drawStatCard(ml + (cardW + 8) * 2, y, 'Rescheduled', String(rescheduleData.tasksRescheduled), warningAmber, rescheduleData.tasksRescheduled > 0);
+        y += cardH + 6;
+
+        // Row 3: half-width cards
+        const halfW = (contentWidth - 8) / 2;
+        // Members card
+        drawStatCard(ml, y, 'Total Members', String(sortedUserIds.length), accentTeal);
+        // Zero tasks card
+        drawStatCard(ml + halfW + 8, y, 'Members with No Tasks', String(usersWithZeroTasks), usersWithZeroTasks > 0 ? warningAmber : slate400, usersWithZeroTasks > 0);
+
+        y += cardH + 20;
+
+        // =========== PER-USER SECTIONS ===========
+        y = ensureSpace(200, y);
+        if (y <= 50) {
+            // We just added a page, so set up
+        }
+
+        doc.rect(ml, y, contentWidth, 1).fill(slate200);
+        y += 12;
+
+        doc.fontSize(13).font('Helvetica-Bold').fillColor(navy).text('Individual Member Reports', ml, y);
+        y += 28;
+
+        for (let userIndex = 0; userIndex < sortedUserIds.length; userIndex++) {
+            const uid = sortedUserIds[userIndex];
+            const userName = usersMap[uid] || 'Unknown User';
+            const userTasks = userTasksMap[uid] || [];
+
+            y = ensureSpace(140, y);
+
+            // ---- User Header: clean navy bar ----
+            const userTaskCount = userTasks.length;
+            const userCompleted = userTasks.filter((t: any) => t.status === 'completed').length;
+            const userOverdue = userTasks.filter((t: any) => {
+                if (t.status !== 'ongoing') return false;
+                const dl = t.deadline?.toDate ? t.deadline.toDate() : null;
+                return dl && dl < now;
+            }).length;
+            const userReschedules = rescheduleData.userRescheduleMap[uid] || 0;
+
+            // Header bar
+            doc.rect(ml, y, contentWidth, 28).fill(navy);
+            doc.fontSize(11).font('Helvetica-Bold').fillColor(white)
+                .text(`${userIndex + 1}. ${userName}`, ml + 10, y + 8, { width: contentWidth - 90 });
+
+            // Task count badge (white bg, black text)
+            const cLabel = `${userTaskCount} task${userTaskCount !== 1 ? 's' : ''}`;
+            const cW = doc.widthOfString(cLabel) + 12;
+            doc.roundedRect(ml + contentWidth - cW - 8, y + 5, cW, 18, 3).fill(white);
+            doc.fontSize(8).font('Helvetica-Bold').fillColor('#111111')
+                .text(cLabel, ml + contentWidth - cW - 8, y + 9, { width: cW, align: 'center' });
+            y += 28;
+
+            if (userTaskCount === 0) {
+                doc.rect(ml, y, contentWidth, 32).fill(slate50);
+                doc.rect(ml, y, contentWidth, 32).lineWidth(0.5).stroke(slate200);
+                doc.fontSize(9).font('Helvetica').fillColor(slate500)
+                    .text('No tasks assigned during this period.', ml + 10, y + 10, { width: contentWidth - 20 });
+                y += 44;
+                continue;
+            }
+
+            // ---- User Micro Metrics ----
+            const mW = (contentWidth - 24) / 4;
+            const mH = 30;
+            const userCompRate = userTaskCount > 0 ? ((userCompleted / userTaskCount) * 100).toFixed(0) : '0';
+
+            const drawMicro = (x: number, label: string, value: string, accent: string, alert: boolean = false) => {
+                doc.rect(x, y, mW, mH).fill(slate50);
+                doc.rect(x, y, 2, mH).fill(accent);
+                doc.fontSize(12).font('Helvetica-Bold').fillColor(alert ? accent : slateBlue)
+                    .text(value, x + 8, y + 4, { width: mW - 14 });
+                doc.fontSize(6.5).font('Helvetica').fillColor(slate500)
+                    .text(label, x + 8, y + 20, { width: mW - 14 });
+            };
+
+            drawMicro(ml, 'Total', String(userTaskCount), infoBlue);
+            drawMicro(ml + mW + 8, `Done (${userCompRate}%)`, String(userCompleted), successGreen);
+            drawMicro(ml + (mW + 8) * 2, 'Overdue', String(userOverdue), dangerRed, userOverdue > 0);
+            drawMicro(ml + (mW + 8) * 3, 'Rescheduled', String(userReschedules), warningAmber, userReschedules > 0);
+            y += mH + 8;
+
+            // ---- Task Cards ----
+            for (const task of userTasks) {
+                y = ensureSpace(90, y);
 
                 const title = task.title || 'Untitled Task';
                 const subtitle = task.subtitle || '';
-                const assignee = usersMap[task.assignedTo] || 'Unknown';
-                const status = task.status || 'unknown';
+                const taskStatus = task.status || 'unknown';
                 const deadline = task.deadline?.toDate ? task.deadline.toDate() : null;
                 const createdAt = task.createdAt?.toDate ? task.createdAt.toDate() : null;
                 const completedAt = task.completedAt?.toDate ? task.completedAt.toDate() : null;
                 const taskRescheduleCount = rescheduleData.rescheduleMap[task.id] || 0;
+                const isOverdue = taskStatus === 'ongoing' && deadline && deadline < now;
 
-                // Check if overdue
-                const isOverdue = status === 'ongoing' && deadline && deadline < now;
+                // Status config
+                let accentColor = slate400;
+                let statusLabel = taskStatus.charAt(0).toUpperCase() + taskStatus.slice(1);
+                let statusTextColor = slate500;
+                let statusBgColor = slate100;
 
-                // Status styling
-                let statusBg = lightGray;
-                let statusText = gray;
-                let statusLabel = status.charAt(0).toUpperCase() + status.slice(1);
-
-                if (status === 'completed') {
-                    statusBg = lightGreen;
-                    statusText = green;
-                } else if (status === 'ongoing') {
+                if (taskStatus === 'completed') {
+                    accentColor = successGreen;
+                    statusTextColor = successGreen;
+                    statusBgColor = successBg;
+                } else if (taskStatus === 'ongoing') {
                     if (isOverdue) {
-                        statusBg = lightRed;
-                        statusText = red;
+                        accentColor = dangerRed;
+                        statusTextColor = dangerRed;
+                        statusBgColor = dangerBg;
                         statusLabel = 'Overdue';
                     } else {
-                        statusBg = lightYellow;
-                        statusText = yellow;
+                        accentColor = warningAmber;
+                        statusTextColor = warningAmber;
+                        statusBgColor = warningBg;
                         statusLabel = 'In Progress';
                     }
-                } else if (status === 'cancelled') {
-                    statusBg = lightRed;
-                    statusText = red;
+                } else if (taskStatus === 'cancelled') {
+                    accentColor = slate500;
+                    statusTextColor = slate500;
+                    statusBgColor = slate100;
                 }
 
-                // Card background - proper height with spacing for all content
-                const taskCardHeight = 110;
-                doc.rect(40, y, contentWidth, taskCardHeight).fill('#ffffff');
-                doc.rect(40, y, contentWidth, taskCardHeight).stroke(borderGray);
+                // Card height
+                const hasRescheduleHistory = taskRescheduleCount > 0 && rescheduleData.taskRescheduleHistory[task.id];
+                const cardHeight = hasRescheduleHistory ? 84 : 70;
 
-                // Left accent bar based on status
-                doc.rect(40, y, 4, taskCardHeight).fill(statusText);
+                // Card base
+                doc.rect(ml, y, contentWidth, cardHeight).fill(white);
+                doc.rect(ml, y, contentWidth, cardHeight).lineWidth(0.5).stroke(slate200);
 
-                // Task Title - Stripping newlines and forcing single line
+                // Left accent
+                doc.rect(ml, y, 3, cardHeight).fill(accentColor);
+
+                // Title
                 const cleanTitle = title.split('\n')[0].replace(/\s+/g, ' ').trim();
-                doc.fontSize(12).font('Helvetica-Bold').fillColor(darkGray).text(
+                doc.fontSize(10).font('Helvetica-Bold').fillColor(slateBlue).text(
                     cleanTitle,
-                    52, y + 12, {
-                    width: contentWidth - 130,
-                    lineBreak: false,
-                    ellipsis: true,
-                    height: 14
-                }
-                );
+                    ml + 12, y + 8, {
+                    width: contentWidth - 110,
+                    lineBreak: false, ellipsis: true, height: 12
+                });
 
-                // Status badge (top right)
-                const badgeWidth = doc.widthOfString(statusLabel) + 16;
-                doc.rect(40 + contentWidth - badgeWidth - 10, y + 10, badgeWidth, 20).fill(statusBg);
-                doc.fontSize(9).font('Helvetica-Bold').fillColor(statusText).text(
+                // Status badge (pill)
+                const bW = doc.widthOfString(statusLabel) + 12;
+                doc.roundedRect(ml + contentWidth - bW - 8, y + 6, bW, 16, 8).fill(statusBgColor);
+                doc.fontSize(7).font('Helvetica-Bold').fillColor(statusTextColor).text(
                     statusLabel,
-                    40 + contentWidth - badgeWidth - 10, y + 15,
-                    { width: badgeWidth, align: 'center' }
+                    ml + contentWidth - bW - 8, y + 9,
+                    { width: bW, align: 'center' }
                 );
 
-                // Reschedule badge (below status badge)
+                // Reschedule pill
                 if (taskRescheduleCount > 0) {
-                    const rescheduleLabel = `${taskRescheduleCount}x Rescheduled`;
-                    const rBadgeWidth = doc.widthOfString(rescheduleLabel) + 16;
-                    doc.rect(40 + contentWidth - rBadgeWidth - 10, y + 32, rBadgeWidth, 16).fill(lightOrange);
-                    doc.fontSize(7).font('Helvetica-Bold').fillColor(orange).text(
-                        rescheduleLabel,
-                        40 + contentWidth - rBadgeWidth - 10, y + 35,
-                        { width: rBadgeWidth, align: 'center' }
+                    const rLabel = `${taskRescheduleCount}x Rescheduled`;
+                    const rW = doc.widthOfString(rLabel) + 10;
+                    doc.roundedRect(ml + contentWidth - rW - 8, y + 24, rW, 12, 6).fill(warningBg);
+                    doc.fontSize(6).font('Helvetica-Bold').fillColor(warningAmber).text(
+                        rLabel,
+                        ml + contentWidth - rW - 8, y + 27,
+                        { width: rW, align: 'center' }
                     );
                 }
 
-                // Subtitle/Description - Aggressively cleaning and forcing single line
-                let subtitleY = y + 36;
+                // Subtitle (single line)
                 if (subtitle) {
-                    // TAKE ONLY THE FIRST LINE, collapse whitespace, and truncate
-                    const firstLine = subtitle.split('\n')[0].trim();
-                    const cleanSubtitle = firstLine.replace(/\s+/g, ' ');
-
-                    doc.fontSize(9).font('Helvetica').fillColor(gray).text(
-                        cleanSubtitle,
-                        52, subtitleY, {
-                        width: contentWidth - 70,
-                        lineBreak: false,
-                        ellipsis: true,
-                        height: 11
-                    }
-                    );
+                    const cleanSub = subtitle.split('\n')[0].replace(/\s+/g, ' ').trim();
+                    doc.fontSize(7.5).font('Helvetica').fillColor(slate500).text(
+                        cleanSub,
+                        ml + 12, y + 24, {
+                        width: contentWidth - 80,
+                        lineBreak: false, ellipsis: true, height: 9
+                    });
                 }
 
-                // Bottom info rows - ensure safe offset from subtitle
-                let infoY = y + 60;
-                doc.fontSize(8).font('Helvetica').fillColor(gray);
-
-                // Row 1: Assignee and Deadline
-                doc.font('Helvetica-Bold').text('Assignee:', 52, infoY);
-                const truncatedAssignee = assignee.length > 18 ? assignee.substring(0, 18) + '...' : assignee;
-                doc.font('Helvetica').text(truncatedAssignee, 105, infoY);
+                // Date info row
+                let dateY = y + 40;
+                doc.fontSize(7.5).fillColor(slate400);
 
                 if (deadline) {
-                    const deadlineStr = deadline.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
-                    doc.font('Helvetica-Bold').fillColor(gray).text('Deadline:', 260, infoY);
-                    doc.font('Helvetica').fillColor(isOverdue ? red : gray).text(deadlineStr, 310, infoY);
-                }
-
-                infoY += 18;
-
-                // Row 2: Completed and Created dates
-                if (status === 'completed' && completedAt) {
-                    const completedStr = completedAt.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
-                    doc.font('Helvetica-Bold').fillColor(gray).text('Completed:', 52, infoY);
-                    doc.font('Helvetica').fillColor(green).text(completedStr, 112, infoY);
+                    const dlStr = deadline.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+                    doc.font('Helvetica').fillColor(slate500).text('Due: ', ml + 12, dateY, { continued: true });
+                    doc.fillColor(isOverdue ? dangerRed : slateBlue).text(dlStr);
                 }
 
                 if (createdAt) {
-                    const createdStr = createdAt.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
-                    doc.font('Helvetica-Bold').fillColor(gray).text('Created:', 260, infoY);
-                    doc.font('Helvetica').fillColor(gray).text(createdStr, 310, infoY);
+                    const crStr = createdAt.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+                    doc.font('Helvetica').fillColor(slate500).text('Created: ', 240, dateY, { continued: true });
+                    doc.fillColor(slate400).text(crStr);
                 }
 
-                y += 125; // Card height + gap
+                dateY += 13;
+
+                if (taskStatus === 'completed' && completedAt) {
+                    const compStr = completedAt.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+                    doc.font('Helvetica').fillColor(slate500).text('Done: ', ml + 12, dateY, { continued: true });
+                    doc.fillColor(successGreen).text(compStr);
+                }
+
+                if (hasRescheduleHistory) {
+                    const history = rescheduleData.taskRescheduleHistory[task.id];
+                    const latest = history[history.length - 1];
+                    if (latest?.previousDeadline) {
+                        const prevStr = latest.previousDeadline.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+                        doc.font('Helvetica').fillColor(slate500).text('Was due: ', 240, dateY, { continued: true });
+                        doc.fillColor(warningAmber).text(prevStr);
+                    }
+                }
+
+                y += cardHeight + 5;
             }
+
+            // Spacing between users
+            y += 10;
         }
 
-        // =========== FOOTER (on all pages) ===========
+        // =========== FOOTER (all pages) ===========
         const pageCount = doc.bufferedPageRange().count;
         for (let i = 0; i < pageCount; i++) {
             doc.switchToPage(i);
 
-            // Footer line
-            doc.moveTo(40, 780).lineTo(pageWidth - 40, 780).stroke(borderGray);
+            doc.moveTo(ml, 782).lineTo(pageWidth - ml, 782).lineWidth(0.5).stroke(slate200);
 
-            // Footer text
-            doc.fontSize(8).font('Helvetica').fillColor(gray).text(
-                `TODO: Manager Report`,
-                40, 790
+            doc.fontSize(7).font('Helvetica').fillColor(slate400).text(
+                'TODO: Manager  |  Confidential Report',
+                ml, 790
             );
             doc.text(
                 `Page ${i + 1} of ${pageCount}`,
