@@ -27,6 +27,8 @@ export {
   deleteUser,
   deleteOwnAccount,
   updateProfile,
+  updateReportExemptList,
+  getReportExemptList,
 } from './controllers/userController';
 
 // ============================================
