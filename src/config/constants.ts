@@ -79,6 +79,22 @@ export const Collections = {
   RESCHEDULE_LOG: 'rescheduleLog',
   INVITES: 'invites',
   NOTIFICATIONS: 'notifications',
+  CONFIG: 'config',
+} as const;
+
+// Config Document Names
+export const ConfigDocs = {
+  REPORT_EXEMPT_USERS: 'reportExemptUsers',
+} as const;
+
+// Firebase Storage Paths
+export const StoragePaths = {
+  TASK_ATTACHMENTS: 'tasks', // tasks/{taskId}/attachments/{fileId}
+} as const;
+
+// Attachment Limits
+export const AttachmentLimits = {
+  MAX_PER_TASK: 3,
 } as const;
 
 // Notification Types

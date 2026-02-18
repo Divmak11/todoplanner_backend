@@ -70,6 +70,9 @@ export interface Task {
   supervisorIds?: string[];
   taskGroupId?: string;
   sourceTeamId?: string;
+
+  // Attachment URLs (max 3 images)
+  attachmentUrls?: string[];
 }
 
 // Task Assignment (subcollection under tasks for multi-assignee tasks)
@@ -170,6 +173,7 @@ export interface AssignTaskInput {
   assignedTo: string | string[]; // Single ID or array for multiple assignees
   deadline: string; // ISO string
   supervisorIds?: string[]; // Users who can see all assignees' completion status
+  attachmentUrls?: string[]; // Optional image attachment URLs (max 3)
 }
 
 export interface UpdateTaskInput {
@@ -178,6 +182,7 @@ export interface UpdateTaskInput {
     title?: string;
     subtitle?: string;
     deadline?: string; // ISO string
+    attachmentUrls?: string[]; // Optional image attachment URLs (max 3)
   };
 }
 
@@ -243,4 +248,9 @@ export interface ResendInviteInput {
 
 export interface CancelInviteInput {
   inviteId: string;
+}
+
+// Report Exempt User Types
+export interface UpdateReportExemptListInput {
+  userIds: string[];
 }
