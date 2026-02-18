@@ -1,0 +1,39 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    // ─────────────────────────────────────────────
+    // Default: deny all reads and writes
+    // ─────────────────────────────────────────────
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+
+    // ─────────────────────────────────────────────
+    // Task Attachments: tasks/{taskId}/attachments/{fileId}
+    // ─────────────────────────────────────────────
+    match /tasks/{taskId}/attachments/{fileId} {
+      // Read: any authenticated user can read task attachments.
+      // Rationale: task-level access control is enforced at the
+      // Firestore / Cloud Function layer, not at the Storage layer.
+      // Restricting reads to task assignees would require a Firestore
+      // lookup inside rules (not supported). Signed URLs are an
+      // alternative but add complexity for cached images.
+      allow read: if request.auth != null;
+
+      // Write: authenticated users may upload attachments with the
+      // following constraints:
+      //   1. File must be an image (MIME type starts with "image/")
+      //   2. File name must end with a valid image extension
+      //      (prevents uploading executable/HTML disguised as image)
+      allow write: if request.auth != null
+                   && request.resource != null
+                   && request.resource.contentType.matches('image/.*')
+                   && fileId.matches('.*\\.(jpg|jpeg|png|webp|heic)');
+
+      // Delete: authenticated users may delete attachments.
+      // The Cloud Function validates ownership before triggering
+      // the delete, so Storage rules only enforce authentication.
+      allow delete: if request.auth != null;
+    }
+  }
+}
