@@ -151,7 +151,7 @@ export const createTeam = onCall(
     // Send notifications AFTER all writes have committed
     await sendMulticastNotification(
       memberIds,
-      '👥 Team Update',
+      'Team Update',
       `Added to ${name}`,
       createNotificationData(NotificationType.TEAM_CREATED, { teamId: teamRef.id })
     );
@@ -335,7 +335,7 @@ export const updateTeam = onCall(
     if (addedMembers.length > 0) {
       await sendMulticastNotification(
         addedMembers,
-        '👥 Team Update',
+        'Team Update',
         `Added to ${teamName}`,
         createNotificationData(NotificationType.MEMBER_ADDED, { teamId })
       );
@@ -344,7 +344,7 @@ export const updateTeam = onCall(
     if (removedMembers.length > 0) {
       await sendMulticastNotification(
         removedMembers,
-        '👥 Team Update',
+        'Team Update',
         `Removed from ${teamName}`,
         createNotificationData(NotificationType.MEMBER_REMOVED, { teamId })
       );
@@ -354,13 +354,13 @@ export const updateTeam = onCall(
     if (newAdminId && oldAdminId) {
       await sendNotification(
         newAdminId,
-        '👑 Admin Role',
+        'Admin Role',
         `You are now the admin of ${teamName}`,
         createNotificationData(NotificationType.ROLE_CHANGED, { teamId })
       );
       await sendNotification(
         oldAdminId,
-        '👑 Admin Change',
+        'Admin Change',
         `You are no longer the admin of ${teamName}`,
         createNotificationData(NotificationType.ROLE_CHANGED, { teamId })
       );
@@ -429,7 +429,7 @@ export const deleteTeam = onCall(
     // 5. Notify members AFTER all writes committed
     await sendMulticastNotification(
       memberIds,
-      '🗑️ Team Deleted',
+      'Team Deleted',
       `${team.name} has been dissolved`,
       createNotificationData(NotificationType.MEMBER_REMOVED, { teamId })
     );

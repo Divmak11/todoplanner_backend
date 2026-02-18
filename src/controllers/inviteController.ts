@@ -110,11 +110,11 @@ export const sendInvite = onCall(
     // Send invite email
     try {
       await sendInviteEmail(email, inviterName, token, teamName);
-      console.log(`✅ Invite sent successfully to ${email}`);
+      console.log(`Invite sent successfully to ${email}`);
     } catch (emailError: any) {
       // If email sending fails, delete the invite and throw error
       await inviteRef.delete();
-      console.error(`❌ Failed to send invite to ${email}:`, emailError.message);
+      console.error(`Failed to send invite to ${email}:`, emailError.message);
       throw new HttpsError(
         'internal',
         `Failed to send invite email: ${emailError.message}`
@@ -337,7 +337,7 @@ export const acceptInvite = onCall(
     // Notify inviter
     await sendNotification(
       invite.invitedBy,
-      'Invite Accepted!',
+      'Invitation Accepted',
       `${user.name} has accepted your invitation`,
       createNotificationData(NotificationType.INVITE_ACCEPTED, { userId })
     );

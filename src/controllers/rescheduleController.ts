@@ -102,7 +102,7 @@ export const requestReschedule = onCall(
     // Notify task creator (who can approve)
     await sendNotification(
       task.createdBy,
-      '📅 Reschedule Request',
+      'Reschedule Request',
       `"${task.title}" needs new deadline`,
       createNotificationData(NotificationType.RESCHEDULE_REQUESTED, {
         taskId,
@@ -203,7 +203,7 @@ export const approveReschedule = onCall(
 
     // Update calendar events and send notifications
     const newDeadlineDate = approved ? approvalRequest.payload.newDeadline.toDate() : null;
-    const notificationTitle = approved ? '✅ Reschedule Approved' : '❌ Reschedule Declined';
+    const notificationTitle = approved ? 'Reschedule Approved' : 'Reschedule Declined';
     const notificationBody = approved
       ? `"${task.title}" • New deadline ${newDeadlineDate?.toLocaleDateString()}`
       : `"${task.title}" request declined`;
@@ -213,7 +213,7 @@ export const approveReschedule = onCall(
       // MULTI-ASSIGNEE: Update all calendar events and notify all assignees
       const assigneeIds: string[] = task.assigneeIds;
 
-      // Update calendar events for all assignees (fire-and-forget)
+      // Update calendar events for all assignees
       if (approved) {
         const assignmentsSnapshot = await db
           .collection(Collections.TASKS)
@@ -239,7 +239,7 @@ export const approveReschedule = onCall(
         );
       }
 
-      // Notify all assignees (fire-and-forget)
+      // Notify all assignees
       const notificationPromises = assigneeIds.map((userId) =>
         sendNotification(
           userId,

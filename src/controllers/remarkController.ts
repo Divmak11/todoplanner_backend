@@ -70,26 +70,34 @@ export const addRemark = onCall(
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
-    // Notify other participants (creator and assignee, excluding caller)
-    const notifyTargets: string[] = [];
+    // Notify other participants (creator and all assignees, excluding caller)
+    const notifyTargets = new Set<string>();
 
     if (task.createdBy !== callerId) {
-      notifyTargets.push(task.createdBy);
+      notifyTargets.add(task.createdBy);
     }
 
-    if (task.assignedTo !== callerId && task.assignedTo !== task.createdBy) {
-      notifyTargets.push(task.assignedTo);
+    // Multi-assignee: notify all assignees except caller
+    if (task.isMultiAssignee && task.assigneeIds?.length > 0) {
+      for (const assigneeId of task.assigneeIds as string[]) {
+        if (assigneeId !== callerId) {
+          notifyTargets.add(assigneeId);
+        }
+      }
+    } else if (task.assignedTo && task.assignedTo !== callerId) {
+      notifyTargets.add(task.assignedTo);
     }
 
-    // Send notifications
-    for (const targetId of notifyTargets) {
-      await sendNotification(
+    // Send notifications in background (non-blocking)
+    const notificationPromises = [...notifyTargets].map((targetId) =>
+      sendNotification(
         targetId,
-        '💬 New Comment',
+        'New Comment',
         `"${task.title}"`,
-        createNotificationData(NotificationType.TASK_ASSIGNED, { taskId, remarkId: remarkRef.id })
-      );
-    }
+        createNotificationData(NotificationType.REMARK_ADDED, { taskId, remarkId: remarkRef.id })
+      ).catch((err) => console.error(`Failed to notify ${targetId} about remark:`, err))
+    );
+    Promise.all(notificationPromises).catch(() => { });
 
     return {
       success: true,
