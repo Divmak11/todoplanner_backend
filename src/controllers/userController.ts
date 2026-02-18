@@ -1,6 +1,6 @@
 import { onCall, HttpsError, CallableRequest } from 'firebase-functions/v2/https';
 import { admin, db, auth } from '../config/firebase-admin';
-import { Collections, UserRole, UserStatus, TaskStatus, NotificationType } from '../config/constants';
+import { Collections, ConfigDocs, UserRole, UserStatus, TaskStatus, NotificationType } from '../config/constants';
 import {
   validateSuperAdminAsync,
   validateRequiredString,
@@ -18,6 +18,7 @@ import {
   UpdateUserRoleInput,
   RevokeUserInput,
   DeleteUserInput,
+  UpdateReportExemptListInput,
 } from '../types';
 
 // 2nd Gen configuration for callable functions
@@ -681,5 +682,149 @@ export const updateProfile = onCall(
     await db.collection(Collections.USERS).doc(userId).update(updates);
 
     return { success: true, message: 'Profile updated successfully' };
+  }
+);
+
+// ============================================
+// REPORT EXEMPT USER LIST MANAGEMENT
+// ============================================
+
+/**
+ * Update the list of users whose tasks are hidden from Team Admin reports.
+ * Only Super Admin can manage this list.
+ *
+ * Security considerations:
+ *  - Validates ALL user IDs exist (prevents stale/fabricated IDs)
+ *  - Prevents the admin from exempting themselves
+ *  - Hard-caps the list at 100 entries to prevent abuse
+ *  - Uses set-with-merge for atomic upsert
+ *  - Records audit trail (updatedBy, updatedAt)
+ *
+ * Race condition note:
+ *  Last-write-wins is acceptable here — this is a low-contention config
+ *  doc edited infrequently by Super Admins only. Firestore transactions
+ *  would add complexity without meaningful benefit.
+ */
+export const updateReportExemptList = onCall(
+  callableConfig,
+  async (request: CallableRequest<UpdateReportExemptListInput>) => {
+    const data = request.data;
+    const context = { auth: request.auth };
+
+    const adminId = await validateSuperAdminAsync(context);
+
+    // ── Input validation ──
+    const userIds = data.userIds;
+
+    if (!Array.isArray(userIds)) {
+      throw new HttpsError('invalid-argument', 'userIds must be an array');
+    }
+
+    // Hard cap to prevent abuse
+    if (userIds.length > 100) {
+      throw new HttpsError(
+        'invalid-argument',
+        'Cannot exempt more than 100 users'
+      );
+    }
+
+    // Deduplicate
+    const uniqueIds = [...new Set(userIds)];
+
+    // Prevent self-exemption: admin should not hide their own tasks
+    if (uniqueIds.includes(adminId)) {
+      throw new HttpsError(
+        'invalid-argument',
+        'You cannot exempt yourself from reports'
+      );
+    }
+
+    // Validate each ID is a non-empty string
+    for (const id of uniqueIds) {
+      if (typeof id !== 'string' || id.trim().length === 0) {
+        throw new HttpsError(
+          'invalid-argument',
+          'Each user ID must be a non-empty string'
+        );
+      }
+    }
+
+    // ── Existence validation (batch, respects Firestore `in` limit of 30) ──
+    if (uniqueIds.length > 0) {
+      const batchSize = 30;
+      const invalidIds: string[] = [];
+
+      for (let i = 0; i < uniqueIds.length; i += batchSize) {
+        const batch = uniqueIds.slice(i, i + batchSize);
+        const snapshot = await db
+          .collection(Collections.USERS)
+          .where(admin.firestore.FieldPath.documentId(), 'in', batch)
+          .get();
+
+        const foundIds = new Set(snapshot.docs.map((doc) => doc.id));
+        for (const id of batch) {
+          if (!foundIds.has(id)) {
+            invalidIds.push(id);
+          }
+        }
+      }
+
+      if (invalidIds.length > 0) {
+        throw new HttpsError(
+          'invalid-argument',
+          `The following user IDs do not exist: ${invalidIds.join(', ')}`
+        );
+      }
+    }
+
+    // ── Atomic upsert ──
+    await db
+      .collection(Collections.CONFIG)
+      .doc(ConfigDocs.REPORT_EXEMPT_USERS)
+      .set(
+        {
+          userIds: uniqueIds,
+          updatedBy: adminId,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+
+    return {
+      success: true,
+      message: `Exempt list updated (${uniqueIds.length} users)`,
+      count: uniqueIds.length,
+    };
+  }
+);
+
+/**
+ * Get the current report exempt user list.
+ * Super Admin only.
+ *
+ * Returns an empty array if the config doc does not exist yet
+ * (first-time use before any exemptions are configured).
+ */
+export const getReportExemptList = onCall(
+  callableConfig,
+  async (request: CallableRequest<unknown>) => {
+    const context = { auth: request.auth };
+
+    await validateSuperAdminAsync(context);
+
+    const doc = await db
+      .collection(Collections.CONFIG)
+      .doc(ConfigDocs.REPORT_EXEMPT_USERS)
+      .get();
+
+    if (!doc.exists) {
+      return { success: true, userIds: [] };
+    }
+
+    const data = doc.data()!;
+    return {
+      success: true,
+      userIds: data.userIds || [],
+    };
   }
 );
