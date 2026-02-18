@@ -90,7 +90,7 @@ export async function sendInviteEmail(
           </div>
           
           <div style="background: #ffffff; padding: 30px; border: 1px solid #e0e0e0; border-top: none; border-radius: 0 0 10px 10px;">
-            <h2 style="color: #333; margin-top: 0;">You're Invited! 🎉</h2>
+            <h2 style="color: #333; margin-top: 0;">You're Invited!</h2>
             
             <p style="font-size: 16px; color: #555;">
               <strong>${inviterName}</strong> has invited you${teamMessage} on ${config.appName} - 
@@ -152,11 +152,11 @@ If you didn't expect this invitation, you can safely ignore this email.
     };
 
     await sgMail.default.send(msg);
-    console.log(`✅ Invite email sent successfully to ${toEmail}`);
+    console.log(`Invite email sent successfully to ${toEmail}`);
     return true;
   } catch (error: any) {
     // Log detailed error for debugging
-    console.error('❌ SendGrid email error:', {
+    console.error('SendGrid email error:', {
       to: toEmail,
       from: config.fromEmail,
       error: error.message,
@@ -215,7 +215,7 @@ export async function sendInviteAcceptedEmail(
           </div>
           
           <div style="background: #ffffff; padding: 30px; border: 1px solid #e0e0e0; border-top: none; border-radius: 0 0 10px 10px;">
-            <h2 style="color: #333; margin-top: 0;">Invitation Accepted! ✅</h2>
+            <h2 style="color: #333; margin-top: 0;">Invitation Accepted</h2>
             
             <p style="font-size: 16px; color: #555;">
               Great news! <strong>${invitedName}</strong> (${invitedEmail}) has accepted your invitation 

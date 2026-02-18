@@ -81,7 +81,17 @@ export async function sendNotification(
     });
     console.log(`Push notification sent to user ${userId}: ${title}`);
   } catch (error) {
-    console.error(`Failed to send push notification to user ${userId}:`, error);
+    const errorCode = (error as { code?: string })?.code || '';
+    if (errorCode === 'messaging/registration-token-not-registered' ||
+      errorCode === 'messaging/invalid-registration-token') {
+      // Purge stale token — frontend self-heals on next app resume
+      console.log(`Purging stale FCM token for user ${userId}`);
+      await db.collection(Collections.USERS).doc(userId).update({
+        fcmToken: admin.firestore.FieldValue.delete(),
+      });
+    } else {
+      console.error(`Failed to send push notification to user ${userId}:`, error);
+    }
   }
 }
 
@@ -106,7 +116,8 @@ export async function sendMulticastNotification(
   }
 
   // Batch get users in chunks of 10 (Firestore limit for 'in' queries)
-  const tokens: string[] = [];
+  // Track token → userId mapping for stale token purging
+  const tokenUserPairs: { token: string; userId: string }[] = [];
   const chunks = chunkArray(userIds, 10);
 
   for (const chunk of chunks) {
@@ -116,14 +127,16 @@ export async function sendMulticastNotification(
 
     userDocs.forEach((doc: admin.firestore.QueryDocumentSnapshot) => {
       const token = doc.data().fcmToken;
-      if (token) tokens.push(token);
+      if (token) tokenUserPairs.push({ token, userId: doc.id });
     });
   }
 
-  if (tokens.length === 0) {
+  if (tokenUserPairs.length === 0) {
     console.log('No FCM tokens found for users, skipping multicast notification');
     return;
   }
+
+  const tokens = tokenUserPairs.map((p) => p.token);
 
   try {
     const response = await messaging.sendEachForMulticast({
@@ -151,6 +164,31 @@ export async function sendMulticastNotification(
     });
 
     console.log(`Multicast notification sent: ${response.successCount} successful, ${response.failureCount} failed`);
+
+    // Purge stale tokens
+    if (response.failureCount > 0) {
+      const purgePromises: Promise<void>[] = [];
+      response.responses.forEach((resp, index) => {
+        if (!resp.success) {
+          const errorCode = (resp.error as { code?: string })?.code || '';
+          if (errorCode === 'messaging/registration-token-not-registered' ||
+            errorCode === 'messaging/invalid-registration-token') {
+            const { userId } = tokenUserPairs[index];
+            console.log(`Purging stale FCM token for user ${userId}`);
+            purgePromises.push(
+              db.collection(Collections.USERS).doc(userId).update({
+                fcmToken: admin.firestore.FieldValue.delete(),
+              }).then(() => { })
+            );
+          }
+        }
+      });
+      if (purgePromises.length > 0) {
+        await Promise.all(purgePromises).catch((err) =>
+          console.error('Failed to purge stale FCM tokens:', err)
+        );
+      }
+    }
   } catch (error) {
     console.error('Failed to send multicast notification:', error);
   }

@@ -12,7 +12,7 @@ const callableConfig = { region: 'asia-south1', concurrency: 80 };
 // ============================================================================
 // CALENDAR LOGGING - Enhanced for debugging token refresh and sync
 // ============================================================================
-const LOG_PREFIX = '📅 [CALENDAR]';
+const LOG_PREFIX = '[CALENDAR]';
 
 // eslint-disable-next-line jsdoc/require-jsdoc
 function calendarLog(
@@ -185,7 +185,7 @@ async function handleCalendarAuthError(error: unknown, userId: string): Promise<
     // Notify user to reconnect
     await sendNotification(
       userId,
-      '🔄 Calendar Reconnection Required',
+      'Calendar Reconnection Required',
       'Your calendar connection expired. Please reconnect in Settings.',
       createNotificationData(NotificationType.TASK_UPDATED, { action: 'calendar_reconnect' })
     );
