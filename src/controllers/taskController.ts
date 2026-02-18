@@ -28,6 +28,7 @@ import {
   CompleteAssignmentInput,
   CancelTaskInput,
   ReopenTaskInput,
+  DeleteTaskInput,
 } from '../types';
 
 // 2nd Gen configuration for callable functions
@@ -310,7 +311,7 @@ export const updateTask = onCall(
       }
       updateData.attachmentUrls = newUrls;
 
-      // Fire-and-forget: Clean up removed attachment files from Storage
+      // Clean up removed attachment files from Storage (non-blocking)
       const oldUrls: string[] = (task.attachmentUrls as string[]) || [];
       const removedUrls = oldUrls.filter((url) => !newUrls.includes(url));
       if (removedUrls.length > 0) {
@@ -344,7 +345,7 @@ export const updateTask = onCall(
       updatedFields.push(`deadline: ${newDeadline.toLocaleDateString()}`);
     }
 
-    // Fire-and-forget: Send notifications in background (non-blocking)
+    // Send notifications in background (non-blocking)
     if (updatedFields.length > 0) {
       const updateMessage = `"${task.title}" updated • ${updatedFields.join(', ')}`;
 
@@ -356,7 +357,7 @@ export const updateTask = onCall(
         const notificationPromises = assigneesToNotify.map((assigneeId) =>
           sendNotification(
             assigneeId,
-            '📝 Task Updated',
+            'Task Updated',
             updateMessage,
             createNotificationData(NotificationType.TASK_UPDATED, { taskId })
           ).catch((err) => console.error(`Failed to notify ${assigneeId}:`, err))
@@ -366,10 +367,10 @@ export const updateTask = onCall(
           console.error('Background notifications failed:', error);
         });
       } else if (task.assignedTo && task.assignedTo !== callerId) {
-        // Single-assignee: notify assignee if not the caller (fire-and-forget)
+        // Single-assignee: notify assignee if not the caller
         sendNotification(
           task.assignedTo,
-          '📝 Task Updated',
+          'Task Updated',
           updateMessage,
           createNotificationData(NotificationType.TASK_UPDATED, { taskId })
         ).catch((err) => console.error('Failed to notify assignee:', err));
@@ -441,9 +442,9 @@ async function completeAssignmentInternal(
   }
 
   // Send notification to creator about this user's completion
-  await sendNotification(
+  sendNotification(
     task.createdBy,
-    '✅ Task Progress',
+    'Task Progress',
     `An assignee completed "${task.title}"${allCompleted ? ' (All done!)' : ''}`,
     createNotificationData(NotificationType.TASK_COMPLETED, { taskId })
   ).catch((error) => {
@@ -685,11 +686,11 @@ export const reopenTask = onCall(
 
       await batch.commit();
 
-      // Fire-and-forget: Send notifications in background (non-blocking)
+      // Send notifications in background (non-blocking)
       const notificationPromises = assigneeIds.map((userId) =>
         sendNotification(
           userId,
-          '🔄 Task Reopened',
+          'Task Reopened',
           `"${task.title}" • Due ${newDeadline.toLocaleDateString()}`,
           createNotificationData(NotificationType.TASK_ASSIGNED, { taskId })
         ).catch((error) => {
@@ -704,7 +705,7 @@ export const reopenTask = onCall(
     } else if (task.assignedTo) {
       const notificationPromise = sendNotification(
         task.assignedTo,
-        '🔄 Task Reopened',
+        'Task Reopened',
         `"${task.title}" • Due ${newDeadline.toLocaleDateString()}`,
         createNotificationData(NotificationType.TASK_ASSIGNED, { taskId })
       ).catch((error) => {
@@ -718,5 +719,135 @@ export const reopenTask = onCall(
     }
 
     return { success: true, message: 'Task reopened' };
+  }
+);
+
+/**
+ * Permanently delete a task and cleanup all related data
+ * Works for both single and multi-assignee tasks
+ *
+ * Cascading cleanup:
+ * 1. Deletes assignment subcollection (multi-assignee)
+ * 2. Auto-rejects pending reschedule requests
+ * 3. Deletes the task document
+ * 4. Deletes storage attachments
+ * 5. Notifies assignees
+ */
+export const deleteTask = onCall(
+  callableConfig,
+  async (request: CallableRequest<DeleteTaskInput>) => {
+    const data = request.data;
+    const context = { auth: request.auth };
+
+    const callerId = validateAuthenticated(context);
+    const taskId = validateRequiredString(data.taskId, 'taskId');
+
+    const taskDoc = await db.collection(Collections.TASKS).doc(taskId).get();
+    if (!taskDoc.exists) {
+      throw new HttpsError('not-found', 'Task not found');
+    }
+
+    const task = taskDoc.data()!;
+
+    // Check isCreator first - if true, skip expensive role checks entirely
+    const isCreator = task.createdBy === callerId;
+
+    // Check role from custom claims first
+    let isSuperAdmin = context.auth?.token?.role === UserRole.SUPER_ADMIN;
+
+    // Only fallback to Firestore if not creator and custom claims don't show super admin
+    if (!isCreator && !isSuperAdmin) {
+      const callerDoc = await db.collection(Collections.USERS).doc(callerId).get();
+      if (callerDoc.exists) {
+        isSuperAdmin = callerDoc.data()?.role === UserRole.SUPER_ADMIN;
+      }
+    }
+
+    if (!(isSuperAdmin || isCreator)) {
+      throw new HttpsError(
+        'permission-denied',
+        'Only creator or Super Admin can delete'
+      );
+    }
+
+    const batch = db.batch();
+
+    // 1. Delete assignment subcollection (multi-assignee tasks)
+    if (task.isMultiAssignee) {
+      const assignmentsRef = db.collection(Collections.TASKS).doc(taskId)
+        .collection(Collections.ASSIGNMENTS);
+      const assignments = await assignmentsRef.get();
+      assignments.docs.forEach((doc) => {
+        batch.delete(doc.ref);
+      });
+    }
+
+    // 2. Auto-reject pending reschedule requests
+    const pendingRequests = await db
+      .collection(Collections.APPROVAL_REQUESTS)
+      .where('targetId', '==', taskId)
+      .where('type', '==', ApprovalRequestType.RESCHEDULE)
+      .where('status', '==', ApprovalStatus.PENDING)
+      .get();
+
+    pendingRequests.docs.forEach((doc) => {
+      batch.update(doc.ref, {
+        status: ApprovalStatus.REJECTED,
+        resolvedAt: admin.firestore.FieldValue.serverTimestamp(),
+        resolvedBy: 'system',
+        resolutionNote: 'Task deleted',
+      });
+    });
+
+    // 3. Delete the task document
+    batch.delete(taskDoc.ref);
+
+    await batch.commit();
+
+    // 4. Delete storage attachments
+    const attachmentUrls: string[] = (task.attachmentUrls as string[]) || [];
+    if (attachmentUrls.length > 0) {
+      const bucket = admin.storage().bucket();
+      Promise.all(
+        attachmentUrls.map((url) => {
+          try {
+            const decodedUrl = decodeURIComponent(url);
+            const pathMatch = decodedUrl.match(/\/o\/(.+?)\?/) || decodedUrl.match(/gs:\/\/[^/]+\/(.+)/);
+            if (pathMatch && pathMatch[1]) {
+              return bucket.file(pathMatch[1]).delete().catch(() => { /* ignore not-found */ });
+            }
+          } catch {
+            // Ignore parsing errors
+          }
+          return Promise.resolve();
+        })
+      ).catch((err) => console.error('Failed to cleanup task attachments:', err));
+    }
+
+    // 5. Notify assignees about deletion
+    const assigneesToNotify: string[] = [];
+    if (task.isMultiAssignee && task.assigneeIds?.length > 0) {
+      assigneesToNotify.push(
+        ...(task.assigneeIds as string[]).filter((id: string) => id !== callerId)
+      );
+    } else if (task.assignedTo && task.assignedTo !== callerId) {
+      assigneesToNotify.push(task.assignedTo);
+    }
+
+    if (assigneesToNotify.length > 0) {
+      const notificationPromises = assigneesToNotify.map((userId) =>
+        sendNotification(
+          userId,
+          'Task Deleted',
+          `"${task.title}" was deleted`,
+          createNotificationData(NotificationType.TASK_DELETED, { taskId })
+        ).catch((err) => console.error(`Failed to notify ${userId}:`, err))
+      );
+      Promise.all(notificationPromises).catch((error) => {
+        console.error('Background delete notifications failed:', error);
+      });
+    }
+
+    return { success: true, message: 'Task deleted successfully' };
   }
 );

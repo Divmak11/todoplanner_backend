@@ -201,6 +201,10 @@ export interface CancelTaskInput {
   taskId: string;
 }
 
+export interface DeleteTaskInput {
+  taskId: string;
+}
+
 export interface ReopenTaskInput {
   taskId: string;
   newDeadline: string; // ISO string
