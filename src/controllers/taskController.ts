@@ -9,6 +9,7 @@ import {
   NotificationType,
   ApprovalRequestType,
   ApprovalStatus,
+  AttachmentLimits,
 } from '../config/constants';
 import {
   validateAuthenticated,
@@ -79,6 +80,21 @@ export const assignTask = onCall(
     const deadline = validateFutureDate(data.deadline, 'Deadline');
     const supervisorIds = data.supervisorIds || [];
 
+    // Validate attachment URLs (optional, max 3)
+    const attachmentUrls = data.attachmentUrls || [];
+    if (!Array.isArray(attachmentUrls)) {
+      throw new HttpsError('invalid-argument', 'attachmentUrls must be an array');
+    }
+    if (attachmentUrls.length > AttachmentLimits.MAX_PER_TASK) {
+      throw new HttpsError(
+        'invalid-argument',
+        `Maximum ${AttachmentLimits.MAX_PER_TASK} attachments allowed per task`
+      );
+    }
+    if (attachmentUrls.some((url: unknown) => typeof url !== 'string' || !url)) {
+      throw new HttpsError('invalid-argument', 'Each attachment URL must be a non-empty string');
+    }
+
     if (assignedType !== AssignmentType.MEMBER && assignedType !== AssignmentType.TEAM) {
       throw new HttpsError(
         'invalid-argument',
@@ -141,7 +157,7 @@ export const assignTask = onCall(
     // SINGLE ASSIGNEE: Use legacy structure for backward compatibility
     if (assigneeIds.length === 1) {
       const assignedTo = assigneeIds[0];
-      const taskRef = await db.collection(Collections.TASKS).add({
+      const singleTaskData: Record<string, unknown> = {
         title,
         subtitle,
         assignedType: AssignmentType.MEMBER,
@@ -152,7 +168,13 @@ export const assignTask = onCall(
         isMultiAssignee: false,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
+      };
+
+      if (attachmentUrls.length > 0) {
+        singleTaskData.attachmentUrls = attachmentUrls;
+      }
+
+      const taskRef = await db.collection(Collections.TASKS).add(singleTaskData);
 
       return { success: true, taskId: taskRef.id };
     }
@@ -178,6 +200,10 @@ export const assignTask = onCall(
 
     if (sourceTeamId) {
       parentTaskData.sourceTeamId = sourceTeamId;
+    }
+
+    if (attachmentUrls.length > 0) {
+      parentTaskData.attachmentUrls = attachmentUrls;
     }
 
     batch.set(taskRef, parentTaskData);
@@ -265,6 +291,46 @@ export const updateTask = onCall(
         throw new HttpsError('invalid-argument', 'Invalid deadline format');
       }
       updateData.deadline = admin.firestore.Timestamp.fromDate(newDeadline);
+    }
+
+    // Handle attachment URLs update
+    if (updates.attachmentUrls !== undefined) {
+      const newUrls = updates.attachmentUrls || [];
+      if (!Array.isArray(newUrls)) {
+        throw new HttpsError('invalid-argument', 'attachmentUrls must be an array');
+      }
+      if (newUrls.length > AttachmentLimits.MAX_PER_TASK) {
+        throw new HttpsError(
+          'invalid-argument',
+          `Maximum ${AttachmentLimits.MAX_PER_TASK} attachments allowed per task`
+        );
+      }
+      if (newUrls.some((url: unknown) => typeof url !== 'string' || !url)) {
+        throw new HttpsError('invalid-argument', 'Each attachment URL must be a non-empty string');
+      }
+      updateData.attachmentUrls = newUrls;
+
+      // Fire-and-forget: Clean up removed attachment files from Storage
+      const oldUrls: string[] = (task.attachmentUrls as string[]) || [];
+      const removedUrls = oldUrls.filter((url) => !newUrls.includes(url));
+      if (removedUrls.length > 0) {
+        const bucket = admin.storage().bucket();
+        Promise.all(
+          removedUrls.map((url) => {
+            try {
+              // Extract path from download URL or gs:// path
+              const decodedUrl = decodeURIComponent(url);
+              const pathMatch = decodedUrl.match(/\/o\/(.+?)\?/) || decodedUrl.match(/gs:\/\/[^/]+\/(.+)/);
+              if (pathMatch && pathMatch[1]) {
+                return bucket.file(pathMatch[1]).delete().catch(() => { /* ignore not-found */ });
+              }
+            } catch {
+              // Ignore parsing errors for individual URLs
+            }
+            return Promise.resolve();
+          })
+        ).catch((err) => console.error('Failed to cleanup removed attachments:', err));
+      }
     }
 
     await db.collection(Collections.TASKS).doc(taskId).update(updateData);
