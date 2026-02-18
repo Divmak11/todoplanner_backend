@@ -60,10 +60,10 @@ export const approveUserAccess = onCall(
     // Set custom claims for the user
     await auth.setCustomUserClaims(userId, { role: user.role });
 
-    // Fire-and-forget: Send notification in background (don't block the response)
+    // Send notification in background (don't block the response)
     sendNotification(
       userId,
-      '✅ Welcome Aboard!',
+      'Welcome Aboard!',
       'Your account is now active',
       createNotificationData(NotificationType.APPROVAL_GRANTED, { userId })
     ).catch((error) => {
@@ -105,7 +105,7 @@ export const rejectUserAccess = onCall(
     if (user.fcmToken) {
       await sendNotification(
         userId,
-        '❌ Access Declined',
+        'Access Declined',
         reason || 'Contact admin for details',
         createNotificationData(NotificationType.APPROVAL_REJECTED, { userId })
       );
@@ -183,7 +183,7 @@ export const updateUserRole = onCall(
       newRole === UserRole.SUPER_ADMIN ? 'Super Admin' : 'Member';
     await sendNotification(
       userId,
-      '🔄 Role Updated',
+      'Role Updated',
       `You are now a ${roleDisplay}`,
       createNotificationData(NotificationType.ROLE_CHANGED, { userId, newRole })
     );
@@ -231,7 +231,7 @@ export const revokeUserAccess = onCall(
     // Notify user
     await sendNotification(
       userId,
-      '🚫 Access Suspended',
+      'Access Suspended',
       'Contact admin for details',
       createNotificationData(NotificationType.APPROVAL_REJECTED, { userId })
     );
@@ -285,7 +285,7 @@ export const restoreUserAccess = onCall(
     // Notify user
     await sendNotification(
       userId,
-      '✅ Welcome Back!',
+      'Welcome Back!',
       'Your access has been restored',
       createNotificationData(NotificationType.APPROVAL_GRANTED, { userId })
     );
@@ -404,11 +404,11 @@ export const deleteUser = onCall(
     const user = userDoc.data()!;
     if (user.googleCalendarConnected) {
       try {
-        console.log(`🗓️ Cleaning up calendar events for deleted user ${userId}`);
+        console.log(`Cleaning up calendar events for deleted user ${userId}`);
         await deleteAllUserCalendarEvents(userId);
-        console.log(`✅ Calendar events cleaned up for ${userId}`);
+        console.log(`Calendar events cleaned up for ${userId}`);
       } catch (error) {
-        console.error(`⚠️ Failed to clean up calendar events for ${userId}:`, error);
+        console.error(`Failed to clean up calendar events for ${userId}:`, error);
         // Continue with deletion even if calendar cleanup fails
       }
     }
@@ -434,7 +434,7 @@ export const deleteUser = onCall(
 
       duplicatesSnapshot.docs.forEach((doc) => {
         if (doc.id !== userId) {
-          console.log(`🗑️ Deleting duplicate/zombie user found for email ${user.email}: ${doc.id}`);
+          console.log(`Deleting duplicate/zombie user found for email ${user.email}: ${doc.id}`);
           batch.delete(doc.ref);
           // Also archive duplicates? Maybe not necessary, but good for completeness 
           // batch.set(db.collection('deleted_users').doc(doc.id), { ...doc.data(), deletedBy: 'System (Duplicate Cleanup)' });
@@ -575,11 +575,11 @@ export const deleteOwnAccount = onCall(
     // IMPORTANT: Do this BEFORE deleting user doc so we can still fetch calendar data
     if (user.googleCalendarConnected) {
       try {
-        console.log(`🗓️ Cleaning up calendar events for self-deleting user ${userId}`);
+        console.log(`Cleaning up calendar events for self-deleting user ${userId}`);
         await deleteAllUserCalendarEvents(userId);
-        console.log(`✅ Calendar events cleaned up for ${userId}`);
+        console.log(`Calendar events cleaned up for ${userId}`);
       } catch (error) {
-        console.error(`⚠️ Failed to clean up calendar events for ${userId}:`, error);
+        console.error(`Failed to clean up calendar events for ${userId}:`, error);
         // Continue with deletion even if calendar cleanup fails
       }
     }
@@ -605,7 +605,7 @@ export const deleteOwnAccount = onCall(
 
       duplicatesSnapshot.docs.forEach((doc) => {
         if (doc.id !== userId) {
-          console.log(`🗑️ Deleting duplicate/zombie user found for email ${user.email}: ${doc.id}`);
+          console.log(`Deleting duplicate/zombie user found for email ${user.email}: ${doc.id}`);
           batch.delete(doc.ref);
         }
       });
@@ -620,7 +620,7 @@ export const deleteOwnAccount = onCall(
       console.error(`Failed to delete auth account for ${userId}:`, error);
     }
 
-    console.log(`✅ User ${userId} deleted their own account`);
+    console.log(`User ${userId} deleted their own account`);
 
     return { success: true, message: 'Account and data deleted successfully' };
   }
@@ -798,33 +798,6 @@ export const updateReportExemptList = onCall(
   }
 );
 
-/**
- * Get the current report exempt user list.
- * Super Admin only.
- *
- * Returns an empty array if the config doc does not exist yet
- * (first-time use before any exemptions are configured).
- */
-export const getReportExemptList = onCall(
-  callableConfig,
-  async (request: CallableRequest<unknown>) => {
-    const context = { auth: request.auth };
-
-    await validateSuperAdminAsync(context);
-
-    const doc = await db
-      .collection(Collections.CONFIG)
-      .doc(ConfigDocs.REPORT_EXEMPT_USERS)
-      .get();
-
-    if (!doc.exists) {
-      return { success: true, userIds: [] };
-    }
-
-    const data = doc.data()!;
-    return {
-      success: true,
-      userIds: data.userIds || [],
-    };
-  }
-);
+// getReportExemptList was removed — the Flutter app now reads
+// config/reportExemptUsers directly via a Firestore real-time stream
+// in DataCacheProvider, eliminating this read-only Cloud Function call.
