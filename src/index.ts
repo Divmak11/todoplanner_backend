@@ -28,7 +28,6 @@ export {
   deleteOwnAccount,
   updateProfile,
   updateReportExemptList,
-  getReportExemptList,
 } from './controllers/userController';
 
 // ============================================
@@ -50,6 +49,7 @@ export {
   completeAssignment,
   cancelTask,
   reopenTask,
+  deleteTask,
 } from './controllers/taskController';
 
 // ============================================
@@ -112,7 +112,6 @@ export {
 export {
   checkDeadlines,
   checkOverdueTasks,
-  cleanupInactiveTracking,
   maintainCalendarTokens,
 } from './triggers/scheduledFunctions';
 

@@ -99,7 +99,7 @@ async function sendConditionalDeadlineReminder(
   const user = userDoc.data();
   const hasCalendar = user?.googleCalendarConnected === true;
 
-  const title = '⏰ Due Tomorrow';
+  const title = 'Due Tomorrow';
   const body = isCreator ? `"${taskTitle}" assigned to team member` : `"${taskTitle}"`;
   const data = createNotificationData(NotificationType.TASK_OVERDUE, { taskId });
 
@@ -194,7 +194,7 @@ export const checkOverdueTasks = onSchedule(
       const count = tasks.length;
       await sendNotification(
         assigneeId,
-        `🔴 ${count} Overdue`,
+        `${count} Overdue`,
         count === 1 ? `"${tasks[0]}"` : `${count} tasks need attention`,
         createNotificationData(NotificationType.TASK_OVERDUE)
       );
@@ -205,7 +205,7 @@ export const checkOverdueTasks = onSchedule(
       const count = tasks.length;
       await sendNotification(
         creatorId,
-        `📊 Tasks Overdue`,
+        'Tasks Overdue',
         count === 1 ? `"${tasks[0]}"` : `${count} assigned tasks past deadline`,
         createNotificationData(NotificationType.TASK_OVERDUE)
       );
@@ -216,7 +216,7 @@ export const checkOverdueTasks = onSchedule(
       const count = tasks.length;
       await sendNotification(
         adminId,
-        `👥 Team Tasks Overdue`,
+        'Team Tasks Overdue',
         count === 1 ? `"${tasks[0]}"` : `${count} team member tasks past deadline`,
         createNotificationData(NotificationType.TASK_OVERDUE)
       );
@@ -225,7 +225,7 @@ export const checkOverdueTasks = onSchedule(
     // Notify Super Admins with summary
     if (allOverdueTasks.length > 0) {
       await notifySuperAdmins(
-        '📊 Daily Report',
+        'Daily Report',
         `${allOverdueTasks.length} overdue task${allOverdueTasks.length > 1 ? 's' : ''} across team`,
         createNotificationData(NotificationType.TASK_OVERDUE)
       );
@@ -236,18 +236,6 @@ export const checkOverdueTasks = onSchedule(
 );
 
 /**
- * Scheduled function: Daily cleanup
- * Runs daily at midnight
- */
-export const cleanupInactiveTracking = onSchedule(
-  { schedule: '0 0 * * *', ...scheduleConfig },
-  async () => {
-    // This is a placeholder for any cleanup tasks
-    // Could be used to archive old data, clean up orphaned records, etc.
-    console.log('Daily cleanup completed.');
-  }
-);
-/**
  * Scheduled function: Maintain Google Calendar tokens
  * Runs on the 1st of every month at 3 AM to proactively refresh tokens
  * and detect revoked access before users experience failures.
@@ -255,7 +243,7 @@ export const cleanupInactiveTracking = onSchedule(
 export const maintainCalendarTokens = onSchedule(
   { schedule: '0 3 1 * *', ...scheduleConfig }, // 3 AM on 1st of month
   async () => {
-    console.log('🔄 [CALENDAR_MAINTENANCE] Starting monthly token check...');
+    console.log('[CALENDAR_MAINTENANCE] Starting monthly token check...');
 
     const usersWithCalendar = await db.collection(Collections.USERS)
       .where('googleCalendarConnected', '==', true)
@@ -269,7 +257,7 @@ export const maintainCalendarTokens = onSchedule(
     const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
 
     if (!clientId || !clientSecret) {
-      console.error('🔄 [CALENDAR_MAINTENANCE] Missing OAuth credentials, aborting');
+      console.error('[CALENDAR_MAINTENANCE] Missing OAuth credentials, aborting');
       return;
     }
 
@@ -281,7 +269,7 @@ export const maintainCalendarTokens = onSchedule(
       const user = userDoc.data();
 
       if (!user.googleRefreshToken) {
-        console.log(`🔄 [CALENDAR_MAINTENANCE] Skipping ${userId} - no refresh token`);
+        console.log(`[CALENDAR_MAINTENANCE] Skipping ${userId} - no refresh token`);
         continue;
       }
 
@@ -294,7 +282,7 @@ export const maintainCalendarTokens = onSchedule(
         if (credentials.access_token) {
           await userDoc.ref.update({ googleAccessToken: credentials.access_token });
           refreshedCount++;
-          console.log(`✅ [CALENDAR_MAINTENANCE] Refreshed token for ${userId}`);
+          console.log(`[CALENDAR_MAINTENANCE] Refreshed token for ${userId}`);
         }
       } catch (error) {
         const msg = error instanceof Error ? error.message : '';
@@ -306,22 +294,22 @@ export const maintainCalendarTokens = onSchedule(
             googleAccessToken: admin.firestore.FieldValue.delete(),
           });
           revokedCount++;
-          console.log(`⚠️ [CALENDAR_MAINTENANCE] Token revoked for ${userId}`);
+          console.log(`[CALENDAR_MAINTENANCE] Token revoked for ${userId}`);
 
           // Notify user about revocation
           await sendNotification(
             userId,
-            '🔄 Calendar Reconnection Required',
+            'Calendar Reconnection Required',
             'Your calendar connection expired. Please reconnect in Settings.',
             createNotificationData(NotificationType.TASK_UPDATED, { action: 'calendar_reconnect' })
           );
         } else {
           errorCount++;
-          console.error(`❌ [CALENDAR_MAINTENANCE] Error for ${userId}:`, msg);
+          console.error(`[CALENDAR_MAINTENANCE] Error for ${userId}:`, msg);
         }
       }
     }
 
-    console.log(`🔄 [CALENDAR_MAINTENANCE] Complete. Refreshed: ${refreshedCount}, Revoked: ${revokedCount}, Errors: ${errorCount}`);
+    console.log(`[CALENDAR_MAINTENANCE] Complete. Refreshed: ${refreshedCount}, Revoked: ${revokedCount}, Errors: ${errorCount}`);
   }
 );

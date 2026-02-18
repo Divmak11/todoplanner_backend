@@ -116,6 +116,8 @@ export const NotificationType = {
   ROLE_CHANGED: 'role_changed',
   INVITE_SENT: 'invite_sent',
   INVITE_ACCEPTED: 'invite_accepted',
+  REMARK_ADDED: 'remark_added',
+  TASK_DELETED: 'task_deleted',
 } as const;
 
 export type NotificationTypeType = typeof NotificationType[keyof typeof NotificationType];
